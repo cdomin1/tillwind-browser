@@ -1,0 +1,406 @@
+use std::{cell::RefCell, path::PathBuf, rc::Rc};
+
+use gtk::{gio, glib, prelude::*};
+use serde::{Deserialize, Serialize};
+use url::Url;
+use webkit6::{WebView, prelude::*};
+
+const APP_ID: &str = "io.github.cdomin1.Tillwind";
+const BLANK: &str = "about:blank";
+
+#[derive(Default, Deserialize, Serialize)]
+struct Session {
+    urls: Vec<String>,
+    selected: u32,
+}
+
+impl Session {
+    fn path() -> PathBuf {
+        glib::user_data_dir().join("tillwind/session.json")
+    }
+
+    fn read() -> Self {
+        std::fs::read(Self::path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let path = Self::path();
+        std::fs::create_dir_all(glib::user_data_dir().join("tillwind"))?;
+        gio::File::for_path(path).replace_contents(
+            &serde_json::to_vec(self)?,
+            None,
+            false,
+            gio::FileCreateFlags::PRIVATE,
+            gio::Cancellable::NONE,
+        )?;
+        Ok(())
+    }
+}
+
+struct Tab {
+    page: gtk::Box,
+    label: gtk::Label,
+    uri: RefCell<String>,
+    view: RefCell<Option<WebView>>,
+}
+
+struct Browser {
+    notebook: gtk::Notebook,
+    address: gtk::Entry,
+    back: gtk::Button,
+    forward: gtk::Button,
+    tabs: RefCell<Vec<Rc<Tab>>>,
+}
+
+fn web_uri(input: &str) -> Option<Url> {
+    Url::parse(input)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+}
+
+fn address_target(input: &str) -> Option<String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    if input == BLANK {
+        return Some(BLANK.into());
+    }
+    if let Some(url) = web_uri(input) {
+        return Some(url.into());
+    }
+    if !input.contains(char::is_whitespace) && !input.contains("://") {
+        if let Some(url) = web_uri(&format!("https://{input}")) {
+            if url.username().is_empty()
+                && url.password().is_none()
+                && url
+                    .host_str()
+                    .is_some_and(|host| host.contains('.') || host == "localhost")
+            {
+                return Some(url.into());
+            }
+        }
+    }
+    let mut search = Url::parse("https://duckduckgo.com/").expect("valid search endpoint");
+    search.query_pairs_mut().append_pair("q", input);
+    Some(search.into())
+}
+
+fn icon(name: &str, description: &str) -> gtk::Button {
+    let button = gtk::Button::from_icon_name(name);
+    button.set_tooltip_text(Some(description));
+    button.update_property(&[gtk::accessible::Property::Label(description)]);
+    button.add_css_class("flat");
+    button
+}
+
+impl Browser {
+    fn tab_for(&self, page: &gtk::Widget) -> Option<Rc<Tab>> {
+        self.tabs
+            .borrow()
+            .iter()
+            .find(|tab| tab.page.upcast_ref::<gtk::Widget>() == page)
+            .cloned()
+    }
+
+    fn current(&self) -> Option<Rc<Tab>> {
+        self.notebook
+            .nth_page(self.notebook.current_page())
+            .and_then(|page| self.tab_for(&page))
+    }
+
+    fn sync_navigation(&self, tab: &Tab) {
+        let uri = tab.uri.borrow();
+        self.address
+            .set_text(if uri.as_str() == BLANK { "" } else { &uri });
+        let view = tab.view.borrow();
+        self.back
+            .set_sensitive(view.as_ref().is_some_and(|view| view.can_go_back()));
+        self.forward
+            .set_sensitive(view.as_ref().is_some_and(|view| view.can_go_forward()));
+    }
+
+    fn add_tab(self: &Rc<Self>, uri: String) -> u32 {
+        let title = web_uri(&uri)
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .unwrap_or_else(|| "New Tab".into());
+        let tab = Rc::new(Tab {
+            page: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            label: gtk::Label::new(Some(&title)),
+            uri: RefCell::new(uri),
+            view: RefCell::new(None),
+        });
+        tab.label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        tab.label.set_max_width_chars(22);
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let close = icon("window-close-symbolic", "Close tab");
+        header.append(&tab.label);
+        header.append(&close);
+        close.connect_clicked(glib::clone!(
+            #[weak(rename_to = browser)]
+            self,
+            #[weak]
+            tab,
+            move |_| browser.close_tab(&tab)
+        ));
+        self.tabs.borrow_mut().push(tab.clone());
+        self.notebook.append_page(&tab.page, Some(&header))
+    }
+
+    fn close_tab(self: &Rc<Self>, tab: &Tab) {
+        if self.notebook.n_pages() == 1 {
+            self.new_tab();
+        }
+        if let Some(index) = self.notebook.page_num(&tab.page) {
+            self.notebook.remove_page(Some(index));
+        }
+        self.tabs
+            .borrow_mut()
+            .retain(|other| other.page != tab.page);
+    }
+
+    fn new_tab(self: &Rc<Self>) {
+        let index = self.add_tab(BLANK.into());
+        self.notebook.set_current_page(Some(index));
+        self.address.grab_focus();
+    }
+
+    fn activate_tab(self: &Rc<Self>, tab: &Rc<Tab>) {
+        if tab.view.borrow().is_none() {
+            let policies = webkit6::WebsitePolicies::builder()
+                .autoplay(webkit6::AutoplayPolicy::Deny)
+                .build();
+            let view = WebView::builder()
+                .website_policies(&policies)
+                .vexpand(true)
+                .build();
+            let recovery = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            recovery.set_valign(gtk::Align::Center);
+            recovery.set_vexpand(true);
+            recovery.append(&gtk::Label::new(Some("This page stopped running.")));
+            let reload = gtk::Button::with_label("Reload Page");
+            reload.set_halign(gtk::Align::Center);
+            recovery.append(&reload);
+            recovery.set_visible(false);
+            tab.page.append(&view);
+            tab.page.append(&recovery);
+            reload.connect_clicked(glib::clone!(
+                #[weak]
+                view,
+                #[weak]
+                recovery,
+                #[weak]
+                tab,
+                move |_| {
+                    recovery.set_visible(false);
+                    view.set_visible(true);
+                    let uri = tab.uri.borrow().clone();
+                    view.load_uri(&uri);
+                }
+            ));
+            view.connect_web_process_terminated(glib::clone!(
+                #[weak]
+                recovery,
+                move |view, _| {
+                    view.set_visible(false);
+                    recovery.set_visible(true);
+                }
+            ));
+            view.connect_load_changed(glib::clone!(
+                #[weak(rename_to = browser)]
+                self,
+                #[weak]
+                tab,
+                #[weak]
+                recovery,
+                move |view, event| {
+                    if event == webkit6::LoadEvent::Started {
+                        recovery.set_visible(false);
+                        view.set_visible(true);
+                    }
+                    if let Some(uri) = view.uri() {
+                        if web_uri(&uri).is_some() || uri == BLANK {
+                            *tab.uri.borrow_mut() = uri.to_string();
+                        }
+                    }
+                    if browser
+                        .current()
+                        .is_some_and(|current| Rc::ptr_eq(&current, &tab))
+                    {
+                        browser.sync_navigation(&tab);
+                    }
+                }
+            ));
+            view.connect_title_notify(glib::clone!(
+                #[weak]
+                tab,
+                move |view| {
+                    if let Some(title) = view.title() {
+                        tab.label.set_label(&title);
+                        tab.label.set_tooltip_text(Some(&title));
+                    }
+                }
+            ));
+            *tab.view.borrow_mut() = Some(view.clone());
+            let uri = tab.uri.borrow().clone();
+            view.load_uri(&uri);
+        }
+        self.sync_navigation(tab);
+    }
+
+    fn save(&self) {
+        let session = Session {
+            urls: (0..self.notebook.n_pages())
+                .filter_map(|index| self.notebook.nth_page(Some(index)))
+                .filter_map(|page| self.tab_for(&page))
+                .map(|tab| tab.uri.borrow().clone())
+                .collect(),
+            selected: self.notebook.current_page().unwrap_or(0),
+        };
+        if let Err(error) = session.save() {
+            eprintln!("Could not save session: {error}");
+        }
+    }
+}
+
+fn build_window(app: &gtk::Application) {
+    if let Some(window) = app.active_window() {
+        window.present();
+        return;
+    }
+    let window = gtk::ApplicationWindow::builder()
+        .application(app)
+        .title("Tillwind")
+        .default_width(1080)
+        .default_height(720)
+        .build();
+    let header = gtk::HeaderBar::new();
+    let address = gtk::Entry::builder()
+        .placeholder_text("Search or enter a URL")
+        .width_chars(42)
+        .build();
+    address.update_property(&[gtk::accessible::Property::Label("Address and search")]);
+    header.set_title_widget(Some(&address));
+    let back = icon("go-previous-symbolic", "Back");
+    let forward = icon("go-next-symbolic", "Forward");
+    let reload = icon("view-refresh-symbolic", "Reload");
+    let add = icon("list-add-symbolic", "New tab");
+    header.pack_start(&back);
+    header.pack_start(&forward);
+    header.pack_start(&reload);
+    header.pack_end(&add);
+    window.set_titlebar(Some(&header));
+    let notebook = gtk::Notebook::builder().scrollable(true).build();
+    window.set_child(Some(&notebook));
+    let browser = Rc::new(Browser {
+        notebook,
+        address,
+        back,
+        forward,
+        tabs: RefCell::new(Vec::new()),
+    });
+
+    let session = Session::read();
+    for uri in session.urls {
+        if uri == BLANK || web_uri(&uri).is_some() {
+            browser.add_tab(uri);
+        }
+    }
+    if browser.notebook.n_pages() == 0 {
+        browser.add_tab(BLANK.into());
+    }
+    browser.notebook.connect_switch_page(glib::clone!(
+        #[weak]
+        browser,
+        move |_, page, _| {
+            if let Some(tab) = browser.tab_for(page) {
+                browser.activate_tab(&tab);
+            }
+        }
+    ));
+    browser
+        .notebook
+        .set_current_page(Some(session.selected.min(browser.notebook.n_pages() - 1)));
+    if let Some(tab) = browser.current() {
+        browser.activate_tab(&tab);
+    }
+
+    browser.address.connect_activate(glib::clone!(
+        #[weak]
+        browser,
+        move |entry| {
+            if let (Some(tab), Some(uri)) = (browser.current(), address_target(&entry.text())) {
+                if let Some(view) = tab.view.borrow().clone() {
+                    view.load_uri(&uri);
+                    view.grab_focus();
+                }
+            }
+        }
+    ));
+    for (button, navigate) in [
+        (&browser.back, WebView::go_back as fn(&WebView)),
+        (&browser.forward, WebView::go_forward as fn(&WebView)),
+        (&reload, WebView::reload as fn(&WebView)),
+    ] {
+        button.connect_clicked(glib::clone!(
+            #[weak]
+            browser,
+            move |_| {
+                if let Some(view) = browser.current().and_then(|tab| tab.view.borrow().clone()) {
+                    navigate(&view);
+                }
+            }
+        ));
+    }
+    add.connect_clicked(glib::clone!(
+        #[weak]
+        browser,
+        move |_| browser.new_tab()
+    ));
+
+    let new_tab = gio::SimpleAction::new("new-tab", None);
+    new_tab.connect_activate(glib::clone!(
+        #[weak]
+        browser,
+        move |_, _| browser.new_tab()
+    ));
+    window.add_action(&new_tab);
+    let close_tab = gio::SimpleAction::new("close-tab", None);
+    close_tab.connect_activate(glib::clone!(
+        #[weak]
+        browser,
+        move |_, _| {
+            if let Some(tab) = browser.current() {
+                browser.close_tab(&tab);
+            }
+        }
+    ));
+    window.add_action(&close_tab);
+    let focus_address = gio::SimpleAction::new("focus-address", None);
+    focus_address.connect_activate(glib::clone!(
+        #[weak]
+        browser,
+        move |_, _| {
+            browser.address.grab_focus();
+            browser.address.select_region(0, -1);
+        }
+    ));
+    window.add_action(&focus_address);
+    app.set_accels_for_action("win.new-tab", &["<Control>t"]);
+    app.set_accels_for_action("win.close-tab", &["<Control>w"]);
+    app.set_accels_for_action("win.focus-address", &["<Control>l"]);
+    window.connect_close_request(move |_| {
+        browser.save();
+        glib::Propagation::Proceed
+    });
+    window.present();
+}
+
+fn main() -> glib::ExitCode {
+    let app = gtk::Application::builder().application_id(APP_ID).build();
+    app.connect_activate(build_window);
+    app.run()
+}
