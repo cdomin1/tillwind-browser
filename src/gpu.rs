@@ -1,3 +1,5 @@
+use crate::nvml;
+
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
@@ -56,6 +58,7 @@ struct ClientId {
 struct Engine {
     counter: Counter,
     capacity: u64,
+    sampled_at: Option<Instant>,
 }
 
 struct Client {
@@ -93,6 +96,7 @@ fn fdinfo(text: &str, scope: Scope) -> Option<(ClientId, Client)> {
                 Engine {
                     counter: Counter::Time(value),
                     capacity: capacity(name),
+                    sampled_at: None,
                 },
             );
         }
@@ -112,6 +116,7 @@ fn fdinfo(text: &str, scope: Scope) -> Option<(ClientId, Client)> {
                 Engine {
                     counter: Counter::Cycles { busy, total },
                     capacity: capacity(name),
+                    sampled_at: None,
                 },
             );
         }
@@ -123,6 +128,7 @@ fn fdinfo(text: &str, scope: Scope) -> Option<(ClientId, Client)> {
 pub struct Activity {
     engines: BTreeMap<(Scope, String, String), f64>,
     has_counters: bool,
+    note: Option<&'static str>,
 }
 
 impl Activity {
@@ -131,7 +137,7 @@ impl Activity {
             return "Engine counters unavailable".into();
         }
         if self.engines.is_empty() {
-            return "Reading engine counters…".into();
+            return self.note.unwrap_or("Reading engine counters…").into();
         }
         let peak = |scope| {
             self.engines
@@ -146,6 +152,41 @@ impl Activity {
             peak(Scope::Tab),
             peak(Scope::Shared)
         )
+    }
+
+    fn add_nvidia(&mut self, samples: Vec<nvml::Sample>, processes: &HashMap<u32, Scope>) {
+        let mut latest = HashMap::<(u32, String), nvml::Sample>::new();
+        for sample in samples {
+            if processes.contains_key(&sample.pid) {
+                latest
+                    .entry((sample.pid, sample.device.clone()))
+                    .and_modify(|current| {
+                        if sample.timestamp > current.timestamp {
+                            *current = sample.clone();
+                        }
+                    })
+                    .or_insert(sample);
+            }
+        }
+        self.has_counters |= !latest.is_empty();
+        for ((pid, _), sample) in latest {
+            let scope = processes[&pid];
+            for (engine, value) in [
+                ("compute/3D", sample.compute),
+                ("encode", sample.encode),
+                ("decode", sample.decode),
+            ] {
+                if value <= 100 {
+                    *self
+                        .engines
+                        .entry((scope, sample.device.clone(), engine.into()))
+                        .or_default() += f64::from(value);
+                }
+            }
+        }
+        for value in self.engines.values_mut() {
+            *value = value.min(100.0);
+        }
     }
 
     pub fn detail(&self) -> String {
@@ -165,13 +206,15 @@ impl Activity {
 #[derive(Default)]
 pub struct Sampler {
     previous: HashMap<ClientId, Client>,
-    time: Option<Instant>,
+    nvml: Option<nvml::Nvml>,
+    nvml_checked: bool,
 }
 
 impl Sampler {
     pub fn sample(&mut self, processes: impl Iterator<Item = (u32, Scope)>) -> Activity {
+        let processes: HashMap<_, _> = processes.collect();
         let mut clients = HashMap::<ClientId, Client>::new();
-        for (pid, scope) in processes {
+        for (&pid, &scope) in &processes {
             for entry in fs::read_dir(format!("/proc/{pid}/fdinfo"))
                 .into_iter()
                 .flatten()
@@ -194,35 +237,51 @@ impl Sampler {
                 }
             }
         }
-        self.update(clients, Instant::now())
+        let mut activity = self.update(clients, Instant::now());
+        if !self.nvml_checked {
+            self.nvml = nvml::Nvml::load();
+            self.nvml_checked = true;
+        }
+        if let Some(nvml) = self.nvml.as_mut() {
+            let readings = nvml.read();
+            if readings.available {
+                activity.has_counters = true;
+                activity.note = Some("No current NVIDIA process samples");
+            }
+            activity.add_nvidia(readings.samples, &processes);
+        }
+        activity
     }
 
     fn update(&mut self, mut clients: HashMap<ClientId, Client>, now: Instant) -> Activity {
-        let elapsed = self.time.replace(now).map(|before| now - before);
         let mut activity = Activity {
             has_counters: !clients.is_empty(),
             ..Default::default()
         };
-        if let Some(elapsed) = elapsed {
-            for (id, client) in &mut clients {
-                let Some(previous) = self.previous.get(id) else {
+        for (id, client) in &mut clients {
+            for (name, engine) in &mut client.engines {
+                engine.sampled_at = Some(now);
+                let Some(previous) = self
+                    .previous
+                    .get(id)
+                    .and_then(|client| client.engines.get(name))
+                else {
                     continue;
                 };
-                for (name, engine) in &mut client.engines {
-                    let Some(previous) = previous.engines.get(name) else {
-                        continue;
-                    };
-                    if let Some(value) =
-                        engine
-                            .counter
-                            .utilization(previous.counter, elapsed, engine.capacity)
-                    {
-                        let key = (client.scope, id.device.clone(), name.clone());
-                        *activity.engines.entry(key).or_default() += value;
-                    } else {
-                        // DRM may briefly report a lower counter before catching up.
-                        engine.counter = previous.counter;
-                    }
+                let elapsed = now - previous.sampled_at.unwrap_or(now);
+                if let Some(value) =
+                    engine
+                        .counter
+                        .utilization(previous.counter, elapsed, engine.capacity)
+                {
+                    let key = (client.scope, id.device.clone(), name.clone());
+                    *activity.engines.entry(key).or_default() += value;
+                } else if std::mem::discriminant(&engine.counter)
+                    == std::mem::discriminant(&previous.counter)
+                {
+                    // DRM may briefly report a lower counter before catching up.
+                    engine.counter = previous.counter;
+                    engine.sampled_at = previous.sampled_at;
                 }
             }
         }
@@ -264,6 +323,55 @@ mod tests {
                 .summary(),
             "Tab 0.0%  ·  Shared —"
         );
+    }
+
+    #[test]
+    fn amd_video_engine_preserves_the_sampling_window_when_counters_regress() {
+        let record = |time| {
+            let text = format!(
+                "drm-driver: amdgpu\ndrm-pdev: 0000:04:00.0\ndrm-client-id: 12\ndrm-engine-dec: {time} ns\n"
+            );
+            [fdinfo(&text, Scope::Tab).unwrap()].into()
+        };
+        let now = Instant::now();
+        let mut sampler = Sampler::default();
+        sampler.update(record(100_000_000), now);
+        assert!(
+            sampler
+                .update(record(80_000_000), now + Duration::from_secs(1))
+                .engines
+                .is_empty()
+        );
+        let reading = sampler.update(record(500_000_000), now + Duration::from_secs(2));
+        assert_eq!(reading.summary(), "Tab 20.0%  ·  Shared —");
+    }
+
+    #[test]
+    fn hybrid_gpu_keeps_nvidia_samples_separate_and_filters_unrelated_processes() {
+        let mut activity = Activity {
+            has_counters: true,
+            engines: [((Scope::Tab, "Intel".into(), "render".into()), 11.0)].into(),
+            ..Default::default()
+        };
+        let sample = |pid, timestamp, compute| nvml::Sample {
+            pid,
+            timestamp,
+            compute,
+            device: "NVIDIA · NVML 0".into(),
+            encode: 0,
+            decode: 0,
+        };
+        activity.add_nvidia(
+            vec![
+                sample(1, 5, 20),
+                sample(1, 4, 90),
+                sample(2, 5, 40),
+                sample(9, 6, 99),
+            ],
+            &[(1, Scope::Tab), (2, Scope::Shared)].into(),
+        );
+        assert_eq!(activity.summary(), "Tab 20.0%  ·  Shared 40.0%");
+        assert!(activity.detail().contains("Intel · render: 11.0%"));
     }
 
     #[test]

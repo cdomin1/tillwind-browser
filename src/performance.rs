@@ -327,9 +327,13 @@ impl History {
 
 const VIDEO_STATS: &str = r#"
 (() => {
-    const videos = Array.from(document.querySelectorAll('video'));
-    const video = videos.find(video => !video.paused && video.videoWidth) ??
-                  videos.find(video => video.videoWidth);
+    const videos = document.getElementsByTagName('video');
+    let video = null;
+    for (const candidate of videos) {
+        if (!candidate.videoWidth) continue;
+        video = candidate;
+        if (!candidate.paused) break;
+    }
     if (!video) return null;
 
     const quality = video.getVideoPlaybackQuality();
@@ -452,7 +456,7 @@ pub struct Performance {
     cpu_model: gtk::Label,
     gpu_model: gtk::Label,
     gpu_activity: gtk::Label,
-    gpu_sampler: RefCell<gpu::Sampler>,
+    gpu_sampler: RefCell<Option<gpu::Sampler>>,
     hardware_loaded: Cell<bool>,
     cpu: gtk::Label,
     memory: gtk::Label,
@@ -461,7 +465,9 @@ pub struct Performance {
     processes: gtk::Label,
     video: gtk::Frame,
     video_text: gtk::Label,
-    sampler: RefCell<Sampler>,
+    sampler: RefCell<Option<Sampler>>,
+    sampling: Cell<bool>,
+    generation: Cell<u64>,
     history: Rc<RefCell<History>>,
     page: Cell<u64>,
     renderer: Cell<Option<u32>>,
@@ -562,6 +568,8 @@ impl Performance {
             video,
             video_text,
             sampler: Default::default(),
+            sampling: Cell::new(false),
+            generation: Cell::new(0),
             history,
             page: Cell::new(0),
             renderer: Cell::new(None),
@@ -590,8 +598,9 @@ impl Performance {
         self.identity.set(None);
         self.video.set_visible(false);
         self.resize_graphs(false);
-        self.sampler.replace(Sampler::default());
-        self.gpu_sampler.replace(gpu::Sampler::default());
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.sampler.replace(None);
+        self.gpu_sampler.replace(None);
         self.gpu_activity.set_text("Engine counters unavailable");
         self.history.replace(History::default());
         self.render(&[], None);
@@ -612,24 +621,7 @@ impl Performance {
             self.page.set(page);
             self.site.set_text(site);
         }
-        let rows = self.sampler.borrow_mut().sample();
-        let renderer = self
-            .identity
-            .get()
-            .and_then(|identity| renderer_pid(&rows, identity));
-        self.render(&rows, renderer);
-        let activity = self
-            .gpu_sampler
-            .borrow_mut()
-            .sample(rows.iter().filter_map(|row| match row.role {
-                Role::Renderer if Some(row.process.pid) == renderer => {
-                    Some((row.process.pid, gpu::Scope::Tab))
-                }
-                Role::Browser | Role::Graphics => Some((row.process.pid, gpu::Scope::Shared)),
-                _ => None,
-            }));
-        self.gpu_activity.set_text(&activity.summary());
-        self.gpu_activity.set_tooltip_text(Some(&activity.detail()));
+        self.sample_processes();
         if let Some((request, started)) = self.request.take() {
             if started.elapsed() < Duration::from_secs(3) {
                 self.request.replace(Some((request, started)));
@@ -659,6 +651,47 @@ impl Performance {
                     panel.refresh_video(&view, &current_request);
                 } else {
                     panel.request.replace(None);
+                }
+            }
+        });
+    }
+
+    fn sample_processes(self: &Rc<Self>) {
+        if self.sampling.replace(true) {
+            return;
+        }
+        let mut sampler = self.sampler.take().unwrap_or_default();
+        let mut gpu_sampler = self.gpu_sampler.take().unwrap_or_default();
+        let identity = self.identity.get();
+        let generation = self.generation.get();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || {
+                let rows = sampler.sample();
+                let renderer = identity.and_then(|identity| renderer_pid(&rows, identity));
+                let activity = gpu_sampler.sample(rows.iter().filter_map(|row| match row.role {
+                    Role::Renderer if Some(row.process.pid) == renderer => {
+                        Some((row.process.pid, gpu::Scope::Tab))
+                    }
+                    Role::Browser | Role::Graphics => Some((row.process.pid, gpu::Scope::Shared)),
+                    _ => None,
+                }));
+                (sampler, gpu_sampler, rows, renderer, activity)
+            })
+            .await;
+            if let Some(panel) = weak.upgrade() {
+                panel.sampling.set(false);
+                if panel.generation.get() != generation {
+                    return;
+                }
+                if let Ok((sampler, gpu_sampler, rows, renderer, activity)) = result {
+                    panel.sampler.replace(Some(sampler));
+                    panel.gpu_sampler.replace(Some(gpu_sampler));
+                    panel.render(&rows, renderer);
+                    panel.gpu_activity.set_text(&activity.summary());
+                    panel
+                        .gpu_activity
+                        .set_tooltip_text(Some(&activity.detail()));
                 }
             }
         });

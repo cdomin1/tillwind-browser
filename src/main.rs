@@ -1,5 +1,6 @@
 mod gpu;
 mod groups;
+mod nvml;
 mod performance;
 
 use std::{
@@ -114,6 +115,7 @@ struct Browser {
     forward: gtk::Button,
     tabs: RefCell<Vec<Rc<Tab>>>,
     performance: Rc<performance::Performance>,
+    performance_timer: RefCell<Option<glib::SourceId>>,
     groups: groups::TabGroups,
     group_label: gtk::Label,
     appearance: Cell<Appearance>,
@@ -484,6 +486,7 @@ fn build_window(app: &gtk::Application) {
         forward,
         tabs: RefCell::new(Vec::new()),
         performance,
+        performance_timer: Default::default(),
         groups: Default::default(),
         group_label,
         appearance: Cell::new(Appearance::System),
@@ -632,7 +635,19 @@ fn build_window(app: &gtk::Application) {
             browser.performance.widget.set_visible(button.is_active());
             if button.is_active() {
                 browser.refresh_performance();
+                let browser_ref = Rc::downgrade(&browser);
+                let timer = glib::timeout_add_local(Duration::from_secs(1), move || {
+                    let Some(browser) = browser_ref.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    browser.refresh_performance();
+                    glib::ControlFlow::Continue
+                });
+                browser.performance_timer.replace(Some(timer));
             } else {
+                if let Some(timer) = browser.performance_timer.take() {
+                    timer.remove();
+                }
                 browser.performance.reset();
             }
         }
@@ -645,15 +660,6 @@ fn build_window(app: &gtk::Application) {
     ));
     window.add_action(&toggle_performance);
     app.set_accels_for_action("win.toggle-performance", &["<Control><Shift>p"]);
-    let browser_ref = Rc::downgrade(&browser);
-    glib::timeout_add_local(Duration::from_secs(1), move || {
-        let Some(browser) = browser_ref.upgrade() else {
-            return glib::ControlFlow::Break;
-        };
-        browser.refresh_performance();
-        glib::ControlFlow::Continue
-    });
-
     let reload = gio::SimpleAction::new("reload", None);
     reload.connect_activate(glib::clone!(
         #[weak]
@@ -729,6 +735,9 @@ fn build_window(app: &gtk::Application) {
     app.set_accels_for_action("win.close-tab", &["<Control>w"]);
     app.set_accels_for_action("win.focus-address", &["<Control>l"]);
     window.connect_close_request(move |_| {
+        if let Some(timer) = browser.performance_timer.take() {
+            timer.remove();
+        }
         browser.performance.reset();
         browser.save();
         glib::Propagation::Proceed
