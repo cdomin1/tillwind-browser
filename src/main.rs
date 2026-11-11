@@ -43,7 +43,8 @@ impl Session {
 }
 
 struct Tab {
-    page: gtk::Box,
+    page: gtk::Overlay,
+    content: gtk::Box,
     label: gtk::Label,
     favicon: gtk::Image,
     uri: RefCell<String>,
@@ -143,8 +144,12 @@ impl Browser {
         let title = web_uri(&uri)
             .and_then(|url| url.host_str().map(str::to_owned))
             .unwrap_or_else(|| "New Tab".into());
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let page = gtk::Overlay::new();
+        page.set_child(Some(&content));
         let tab = Rc::new(Tab {
-            page: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            page,
+            content,
             label: gtk::Label::new(Some(&title)),
             favicon: gtk::Image::from_icon_name("web-browser-symbolic"),
             uri: RefCell::new(uri),
@@ -198,6 +203,7 @@ impl Browser {
     }
 
     fn activate_tab(self: &Rc<Self>, tab: &Rc<Tab>) {
+        self.performance.attach(&tab.page);
         if tab.view.borrow().is_none() {
             let policies = webkit6::WebsitePolicies::builder()
                 .autoplay(webkit6::AutoplayPolicy::Deny)
@@ -214,8 +220,8 @@ impl Browser {
             reload.set_halign(gtk::Align::Center);
             recovery.append(&reload);
             recovery.set_visible(false);
-            tab.page.append(&view);
-            tab.page.append(&recovery);
+            tab.content.append(&view);
+            tab.content.append(&recovery);
             reload.connect_clicked(glib::clone!(
                 #[weak]
                 view,
@@ -355,8 +361,9 @@ fn build_window(app: &gtk::Application) {
     header.pack_start(&forward);
     header.pack_end(&add);
     let monitor = gtk::ToggleButton::new();
-    monitor.set_icon_name("utilities-system-monitor-symbolic");
+    monitor.set_icon_name("sidebar-show-right-symbolic");
     monitor.add_css_class("flat");
+    monitor.add_css_class("performance-toggle");
     monitor.set_tooltip_text(Some("Performance sidebar (Ctrl+Shift+P)"));
     monitor.update_property(&[gtk::accessible::Property::Label("Performance sidebar")]);
     header.pack_end(&monitor);
@@ -367,11 +374,7 @@ fn build_window(app: &gtk::Application) {
         .build();
     notebook.add_css_class("browser-tabs");
     let performance = performance::Performance::new();
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    notebook.set_hexpand(true);
-    content.append(&notebook);
-    content.append(&performance.widget);
-    window.set_child(Some(&content));
+    window.set_child(Some(&notebook));
     let address_focus = gtk::EventControllerFocus::new();
     address.add_controller(address_focus.clone());
     let browser = Rc::new(Browser {

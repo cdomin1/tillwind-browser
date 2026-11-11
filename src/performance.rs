@@ -11,7 +11,9 @@ use gtk::{gio, glib, prelude::*};
 use webkit6::{WebView, prelude::*};
 
 const MESSAGE: &str = "tillwind-process";
-const HISTORY: usize = 36;
+const HISTORY: usize = 60;
+const CPU_GRAPH_HEIGHT: i32 = 68;
+const MEMORY_GRAPH_HEIGHT: i32 = 38;
 const MIB: f64 = 1024.0 * 1024.0;
 
 pub struct WebExtension(PathBuf);
@@ -69,6 +71,7 @@ struct Process {
     start: u64,
     ticks: u64,
     rss: u64,
+    threads: u64,
 }
 
 impl Process {
@@ -85,6 +88,7 @@ impl Process {
             ticks: field(11)?.saturating_add(field(12)?),
             start: field(19)?,
             rss: field(21)?,
+            threads: field(17)?,
         })
     }
 
@@ -211,13 +215,65 @@ fn label(text: &str, class: &str) -> gtk::Label {
     label
 }
 
-fn history_graph(values: &VecDeque<f64>, scale: f64) -> String {
-    const LEVELS: [char; 9] = ['·', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let mut graph = "·".repeat(HISTORY.saturating_sub(values.len()));
-    graph.extend(values.iter().map(|value| {
-        let level = (8.0 * value / scale).ceil().clamp(0.0, 8.0) as usize;
-        LEVELS[level]
-    }));
+fn panel_frame(title: &str, class: &str, children: &[&impl IsA<gtk::Widget>]) -> gtk::Frame {
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 5);
+    body.add_css_class("performance-frame-body");
+    for child in children {
+        body.append(*child);
+    }
+    let frame = gtk::Frame::new(Some(title));
+    frame.add_css_class("performance-frame");
+    frame.add_css_class(class);
+    frame.set_child(Some(&body));
+    frame
+}
+
+fn chart_scale(values: &VecDeque<f64>, minimum: f64) -> f64 {
+    values.iter().copied().fold(minimum, f64::max)
+}
+
+fn history_graph(
+    history: &Rc<RefCell<History>>,
+    samples: fn(&History) -> &VecDeque<f64>,
+    minimum: f64,
+    color: (f64, f64, f64),
+    height: i32,
+) -> gtk::DrawingArea {
+    let graph = gtk::DrawingArea::builder().content_height(height).build();
+    let history = history.clone();
+    graph.set_draw_func(move |_, context, width, height| {
+        let width = f64::from(width);
+        let height = f64::from(height);
+        let history = history.borrow();
+        let values = samples(&history);
+        let scale = chart_scale(values, minimum);
+        let column = width / HISTORY as f64;
+        let levels = (height / 4.0) as usize;
+        if levels == 0 || column <= 0.0 {
+            return;
+        }
+
+        // Keep the grid visible even before the first sample arrives.
+        context.set_source_rgba(color.0, color.1, color.2, 0.23);
+        for guide in [0.0, 0.5, 1.0] {
+            let y = 1.0 + (height - 3.0) * guide;
+            for index in 0..HISTORY {
+                context.rectangle((index as f64 + 0.5) * column, y, 1.0, 1.0);
+            }
+        }
+        let _ = context.fill();
+
+        context.set_source_rgb(color.0, color.1, color.2);
+        let first = HISTORY - values.len();
+        for (index, value) in values.iter().enumerate() {
+            let dots = (value / scale * levels as f64).ceil() as usize;
+            let x = ((first + index) as f64 + 0.5) * column;
+            for dot in 0..dots {
+                context.rectangle(x, height - 3.0 - 4.0 * dot as f64, 1.5, 1.5);
+            }
+        }
+        let _ = context.fill();
+    });
     graph
 }
 
@@ -240,16 +296,53 @@ impl History {
     }
 }
 
+const VIDEO_STATS: &str = r#"
+(() => {
+    const videos = Array.from(document.querySelectorAll('video'));
+    const video = videos.find(video => !video.paused && video.videoWidth) ??
+                  videos.find(video => video.videoWidth);
+    if (!video) return null;
+
+    const quality = video.getVideoPlaybackQuality();
+    let buffer = 0;
+    for (let index = 0; index < video.buffered.length; index++) {
+        if (video.buffered.start(index) <= video.currentTime &&
+            video.buffered.end(index) >= video.currentTime) {
+            buffer = video.buffered.end(index) - video.currentTime;
+            break;
+        }
+    }
+    return JSON.stringify({
+        width: video.videoWidth,
+        height: video.videoHeight,
+        dropped: quality.droppedVideoFrames,
+        frames: quality.totalVideoFrames,
+        buffer
+    });
+})()
+"#;
+
+#[derive(serde::Deserialize)]
+struct VideoStats {
+    width: u32,
+    height: u32,
+    dropped: u64,
+    frames: u64,
+    buffer: f64,
+}
+
 pub struct Performance {
     pub widget: gtk::ScrolledWindow,
     site: gtk::Label,
     cpu: gtk::Label,
     memory: gtk::Label,
-    cpu_graph: gtk::Label,
-    memory_graph: gtk::Label,
+    cpu_graph: gtk::DrawingArea,
+    memory_graph: gtk::DrawingArea,
     processes: gtk::Label,
+    video: gtk::Frame,
+    video_text: gtk::Label,
     sampler: RefCell<Sampler>,
-    history: RefCell<History>,
+    history: Rc<RefCell<History>>,
     page: Cell<u64>,
     renderer: Cell<Option<u32>>,
     identity: Cell<Option<(u32, u64)>>,
@@ -258,37 +351,64 @@ pub struct Performance {
 
 impl Performance {
     pub fn new() -> Rc<Self> {
-        let panel = gtk::Box::new(gtk::Orientation::Vertical, 9);
+        let panel = gtk::Box::new(gtk::Orientation::Vertical, 6);
         panel.add_css_class("performance-panel");
         let heading = label("Performance", "performance-heading");
         let site = label("New Tab", "performance-site");
         site.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-        let cpu = label("CPU  —", "performance-cpu");
-        let memory = label("MEM  —", "performance-memory");
-        let cpu_graph = label(&"·".repeat(HISTORY), "performance-cpu");
-        let memory_graph = label(&"·".repeat(HISTORY), "performance-memory");
+        let cpu = label("—", "performance-value");
+        let memory = label("—", "performance-value");
+        let history = Rc::new(RefCell::new(History::default()));
+        let cpu_graph = history_graph(
+            &history,
+            |history| &history.cpu,
+            100.0,
+            (0.45, 0.81, 0.72),
+            CPU_GRAPH_HEIGHT,
+        );
+        let memory_graph = history_graph(
+            &history,
+            |history| &history.rss,
+            64.0,
+            (0.76, 0.83, 0.55),
+            MEMORY_GRAPH_HEIGHT,
+        );
+        let cpu_contents = gtk::Box::new(gtk::Orientation::Vertical, 5);
+        cpu_contents.append(&cpu);
+        cpu_contents.append(&cpu_graph);
+        let memory_contents = gtk::Box::new(gtk::Orientation::Vertical, 5);
+        memory_contents.append(&memory);
+        memory_contents.append(&memory_graph);
         let processes = label("", "performance-table");
         let note = label(
-            "CPU is relative to one core. RSS includes shared memory. A renderer may host multiple pages. Network and GPU processes are browser-wide.",
+            "CPU · 100% = one core. RSS includes shared memory. WebKit can share a renderer between pages.",
             "performance-note",
         );
         note.set_wrap(true);
-        note.set_max_width_chars(37);
-        for child in [
-            &heading,
-            &site,
-            &cpu,
-            &cpu_graph,
-            &memory,
-            &memory_graph,
-            &processes,
-            &note,
-        ] {
-            panel.append(child);
-        }
+        note.set_max_width_chars(35);
+        panel.append(&heading);
+        panel.append(&site);
+        panel.append(&panel_frame("cpu", "performance-cpu", &[&cpu_contents]));
+        panel.append(&panel_frame(
+            "mem",
+            "performance-memory",
+            &[&memory_contents],
+        ));
+        let video_text = label("", "performance-value");
+        let video = panel_frame("video", "performance-video", &[&video_text]);
+        video.set_visible(false);
+        panel.append(&video);
+        panel.append(&panel_frame(
+            "proc",
+            "performance-processes",
+            &[&processes, &note],
+        ));
         let widget = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .width_request(340)
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Fill)
+            .css_classes(["performance-overlay"])
             .child(&panel)
             .visible(false)
             .build();
@@ -300,13 +420,26 @@ impl Performance {
             cpu_graph,
             memory_graph,
             processes,
+            video,
+            video_text,
             sampler: Default::default(),
-            history: Default::default(),
+            history,
             page: Cell::new(0),
             renderer: Cell::new(None),
             identity: Cell::new(None),
             request: Default::default(),
         })
+    }
+
+    pub fn attach(&self, page: &gtk::Overlay) {
+        if let Some(parent) = self.widget.parent().and_downcast::<gtk::Overlay>() {
+            if parent == *page {
+                return;
+            }
+            parent.remove_overlay(&self.widget);
+        }
+        page.add_overlay(&self.widget);
+        page.set_measure_overlay(&self.widget, false);
     }
 
     pub fn reset(&self) {
@@ -316,6 +449,8 @@ impl Performance {
         self.page.set(0);
         self.renderer.set(None);
         self.identity.set(None);
+        self.video.set_visible(false);
+        self.resize_graphs(false);
         self.sampler.replace(Sampler::default());
         self.history.replace(History::default());
         self.render(&[], None);
@@ -347,20 +482,65 @@ impl Performance {
         let current_request = request.clone();
         let weak = Rc::downgrade(self);
         let message = webkit6::UserMessage::new(MESSAGE, None);
+        let active_view = view.downgrade();
         view.send_message_to_page(&message, Some(&request), move |reply| {
             if current_request.is_cancelled() {
                 return;
             }
             if let Some(panel) = weak.upgrade() {
-                panel.request.replace(None);
                 let identity = reply
                     .ok()
                     .filter(|reply| reply.name().as_deref() == Some(MESSAGE))
                     .and_then(|reply| reply.parameters())
                     .and_then(|identity| identity.get::<(u32, u64)>());
                 panel.identity.set(identity);
+                if let Some(view) = active_view.upgrade() {
+                    panel.refresh_video(&view, &current_request);
+                } else {
+                    panel.request.replace(None);
+                }
             }
         });
+    }
+
+    fn refresh_video(self: &Rc<Self>, view: &WebView, request: &gio::Cancellable) {
+        let weak = Rc::downgrade(self);
+        let current_request = request.clone();
+        view.evaluate_javascript(
+            VIDEO_STATS,
+            Some("tillwind-performance"),
+            None,
+            Some(request),
+            move |result| {
+                if current_request.is_cancelled() {
+                    return;
+                }
+                if let Some(panel) = weak.upgrade() {
+                    panel.request.replace(None);
+                    let stats = result
+                        .ok()
+                        .and_then(|value| serde_json::from_str::<VideoStats>(&value.to_str()).ok());
+                    panel.video.set_visible(stats.is_some());
+                    panel.resize_graphs(stats.is_some());
+                    if let Some(stats) = stats {
+                        panel.video_text.set_text(&format!(
+                            "{} × {}    buffer {:.1}s\nFrames {} · dropped {}",
+                            stats.width, stats.height, stats.buffer, stats.frames, stats.dropped
+                        ));
+                    }
+                }
+            },
+        );
+    }
+
+    fn resize_graphs(&self, video_visible: bool) {
+        let (cpu, memory) = if video_visible && self.widget.height() < 490 {
+            (46, 24)
+        } else {
+            (CPU_GRAPH_HEIGHT, MEMORY_GRAPH_HEIGHT)
+        };
+        self.cpu_graph.set_content_height(cpu);
+        self.memory_graph.set_content_height(memory);
     }
 
     fn render(&self, rows: &[Usage], renderer: Option<u32>) {
@@ -375,27 +555,25 @@ impl Performance {
         let cpu = current.and_then(|row| row.cpu);
         let rss = current.map(|row| row.rss);
         self.cpu
-            .set_text(&cpu.map_or("CPU  —".into(), |cpu| format!("CPU  {cpu:.1}%")));
+            .set_text(&cpu.map_or("—".into(), |cpu| format!("{cpu:.1}%   renderer")));
         self.memory
-            .set_text(&rss.map_or("MEM  —".into(), |rss| format!("MEM  {rss:.1} MiB RSS")));
-        let cpu_scale = history.cpu.iter().copied().fold(100.0, f64::max);
-        let rss_scale = history.rss.iter().copied().fold(64.0, f64::max);
+            .set_text(&rss.map_or("—".into(), |rss| format!("{rss:.1} MiB   resident")));
+        let cpu_scale = chart_scale(&history.cpu, 100.0);
+        let rss_scale = chart_scale(&history.rss, 64.0);
+        self.cpu_graph.queue_draw();
+        self.memory_graph.queue_draw();
         self.cpu_graph
-            .set_text(&history_graph(&history.cpu, cpu_scale));
+            .set_tooltip_text(Some(&format!("CPU history · 0–{cpu_scale:.0}%")));
         self.memory_graph
-            .set_text(&history_graph(&history.rss, rss_scale));
-        self.cpu_graph
-            .set_tooltip_text(Some(&format!("CPU chart range: 0–{cpu_scale:.0}%")));
-        self.memory_graph
-            .set_tooltip_text(Some(&format!("RSS chart range: 0–{rss_scale:.0} MiB")));
+            .set_tooltip_text(Some(&format!("RSS history · 0–{rss_scale:.0} MiB")));
 
-        let mut table = String::from("PROCESS          PID    CPU%   MiB\n");
+        let mut table = String::from("PROCESS        PID   CPU%   MiB  THR\n");
         if let Some(row) = current {
             append_row(&mut table, row);
         } else {
             table.push_str("Page renderer unavailable\n");
         }
-        table.push_str("\nSHARED\n");
+        table.push_str("SHARED\n");
         for row in rows.iter().filter(|row| row.role != Role::Renderer) {
             append_row(&mut table, row);
         }
@@ -406,10 +584,11 @@ impl Performance {
 fn append_row(table: &mut String, row: &Usage) {
     let cpu = row.cpu.map_or("—".into(), |cpu| format!("{cpu:.1}"));
     table.push_str(&format!(
-        "{:<13} {:>6} {:>7} {:>5.0}\n",
+        "{:<13} {:>6} {:>6} {:>5.0} {:>4}\n",
         row.role.title(),
         row.process.pid,
         cpu,
-        row.rss
+        row.rss,
+        row.process.threads
     ));
 }
