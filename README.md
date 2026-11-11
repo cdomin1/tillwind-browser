@@ -2,7 +2,7 @@
 
 Tillwind is a lightweight, Safari-inspired browser for Linux. Its Rust and GTK 4 interface pairs a centered address field with a separate tab strip. WebKitGTK renders pages.
 
-![Tillwind displaying the Wikipedia article on Linux, with the centered address field and three tabs visible](docs/screenshots/wikipedia.png)
+![Tillwind displaying a YouTube watch page, with the centered address field and three tabs visible](docs/screenshots/youtube.png)
 
 ## Features
 
@@ -14,9 +14,9 @@ Tillwind is a lightweight, Safari-inspired browser for Linux. Its Rust and GTK 4
 
 ## Screenshots
 
-| GitHub | MDN Web Docs |
+| Google Search | AP News |
 | --- | --- |
-| ![Tillwind displaying the Rust project repository on GitHub](docs/screenshots/github.png) | ![Tillwind displaying the CSS reference on MDN Web Docs](docs/screenshots/mdn.png) |
+| ![Tillwind displaying Google Search results for Linux web browsers](docs/screenshots/google-search.png) | ![Tillwind displaying the AP News homepage](docs/screenshots/ap-news.png) |
 
 ## Run on Linux
 
