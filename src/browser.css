@@ -147,3 +147,11 @@ headerbar.browser-toolbar button.performance-toggle:checked {
     color: #c6bda5;
     font-size: 11px;
 }
+
+.performance-panel .performance-gpu {
+    border-color: #83b4ba;
+}
+
+.performance-panel .performance-gpu .performance-value {
+    color: #b0d8de;
+}

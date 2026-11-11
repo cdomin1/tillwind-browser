@@ -1,3 +1,4 @@
+mod gpu;
 mod performance;
 
 use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
@@ -361,7 +362,7 @@ fn build_window(app: &gtk::Application) {
     header.pack_start(&forward);
     header.pack_end(&add);
     let monitor = gtk::ToggleButton::new();
-    monitor.set_icon_name("sidebar-show-right-symbolic");
+    monitor.set_child(Some(&performance::gauge_icon()));
     monitor.add_css_class("flat");
     monitor.add_css_class("performance-toggle");
     monitor.set_tooltip_text(Some("Performance sidebar (Ctrl+Shift+P)"));

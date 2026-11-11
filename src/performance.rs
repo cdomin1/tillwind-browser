@@ -9,6 +9,8 @@ use std::{
 };
 
 use gtk::{gio, glib, prelude::*};
+
+use crate::gpu;
 use webkit6::{WebView, prelude::*};
 
 const MESSAGE: &str = "tillwind-process";
@@ -216,6 +218,32 @@ fn label(text: &str, class: &str) -> gtk::Label {
     label
 }
 
+pub fn gauge_icon() -> gtk::DrawingArea {
+    let icon = gtk::DrawingArea::builder()
+        .content_width(16)
+        .content_height(16)
+        .build();
+    icon.set_draw_func(|widget, context, width, height| {
+        let color = widget.color();
+        context.set_source_rgba(
+            color.red().into(),
+            color.green().into(),
+            color.blue().into(),
+            color.alpha().into(),
+        );
+        context.translate(f64::from(width) / 2.0, f64::from(height) / 2.0);
+        context.set_line_width(1.4);
+        context.set_line_cap(gtk::cairo::LineCap::Round);
+        let pi = std::f64::consts::PI;
+        context.arc(0.0, 1.0, 6.1, 0.82 * pi, 2.18 * pi);
+        let _ = context.stroke();
+        context.move_to(0.0, 1.0);
+        context.line_to(2.8, -1.8);
+        let _ = context.stroke();
+    });
+    icon
+}
+
 fn panel_frame(title: &str, class: &str, children: &[&impl IsA<gtk::Widget>]) -> gtk::Frame {
     let body = gtk::Box::new(gtk::Orientation::Vertical, 5);
     body.add_css_class("performance-frame-body");
@@ -418,9 +446,13 @@ fn hardware_names() -> (String, String) {
 
 pub struct Performance {
     pub widget: gtk::ScrolledWindow,
+    panel: gtk::Box,
+    process_note: gtk::Label,
     site: gtk::Label,
     cpu_model: gtk::Label,
     gpu_model: gtk::Label,
+    gpu_activity: gtk::Label,
+    gpu_sampler: RefCell<gpu::Sampler>,
     hardware_loaded: Cell<bool>,
     cpu: gtk::Label,
     memory: gtk::Label,
@@ -446,6 +478,7 @@ impl Performance {
         site.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         let cpu_model = label("", "performance-hardware");
         let gpu_model = label("", "performance-hardware");
+        let gpu_activity = label("Engine counters unavailable", "performance-value");
         for model in [&cpu_model, &gpu_model] {
             model.set_ellipsize(gtk::pango::EllipsizeMode::End);
         }
@@ -475,15 +508,19 @@ impl Performance {
         memory_contents.append(&memory_graph);
         let processes = label("", "performance-table");
         let note = label("100% CPU = one core · memory = RSS", "performance-note");
-        note.set_tooltip_text(Some(
-            "RSS includes shared memory. WebKit can share a renderer between pages.",
+        processes.set_tooltip_text(Some(
+            "100% CPU equals one core. RSS includes shared memory. WebKit can share a renderer between pages.",
         ));
         note.set_wrap(true);
         note.set_max_width_chars(35);
         panel.append(&heading);
         panel.append(&site);
-        panel.append(&gpu_model);
         panel.append(&panel_frame("cpu", "performance-cpu", &[&cpu_contents]));
+        panel.append(&panel_frame(
+            "gpu",
+            "performance-gpu",
+            &[&gpu_model, &gpu_activity],
+        ));
         panel.append(&panel_frame(
             "mem",
             "performance-memory",
@@ -509,9 +546,13 @@ impl Performance {
             .build();
         Rc::new(Self {
             widget,
+            panel,
+            process_note: note,
             site,
             cpu_model,
             gpu_model,
+            gpu_activity,
+            gpu_sampler: Default::default(),
             hardware_loaded: Cell::new(false),
             cpu,
             memory,
@@ -550,6 +591,8 @@ impl Performance {
         self.video.set_visible(false);
         self.resize_graphs(false);
         self.sampler.replace(Sampler::default());
+        self.gpu_sampler.replace(gpu::Sampler::default());
+        self.gpu_activity.set_text("Engine counters unavailable");
         self.history.replace(History::default());
         self.render(&[], None);
     }
@@ -559,7 +602,7 @@ impl Performance {
             let (cpu, gpu) = hardware_names();
             self.cpu_model.set_text(&cpu);
             self.cpu_model.set_tooltip_text(Some(&cpu));
-            self.gpu_model.set_text(&format!("GPU · {gpu}"));
+            self.gpu_model.set_text(&gpu);
             self.gpu_model
                 .set_tooltip_text(Some(&format!("Detected graphics adapters: {gpu}")));
         }
@@ -575,6 +618,18 @@ impl Performance {
             .get()
             .and_then(|identity| renderer_pid(&rows, identity));
         self.render(&rows, renderer);
+        let activity = self
+            .gpu_sampler
+            .borrow_mut()
+            .sample(rows.iter().filter_map(|row| match row.role {
+                Role::Renderer if Some(row.process.pid) == renderer => {
+                    Some((row.process.pid, gpu::Scope::Tab))
+                }
+                Role::Browser | Role::Graphics => Some((row.process.pid, gpu::Scope::Shared)),
+                _ => None,
+            }));
+        self.gpu_activity.set_text(&activity.summary());
+        self.gpu_activity.set_tooltip_text(Some(&activity.detail()));
         if let Some((request, started)) = self.request.take() {
             if started.elapsed() < Duration::from_secs(3) {
                 self.request.replace(Some((request, started)));
@@ -640,8 +695,12 @@ impl Performance {
     }
 
     fn resize_graphs(&self, video_visible: bool) {
-        let (cpu, memory) = if video_visible && self.widget.height() < 490 {
-            (32, 18)
+        let compact = self.widget.height() < 490;
+        let dense = compact && video_visible;
+        self.panel.set_spacing(if dense { 4 } else { 6 });
+        self.process_note.set_visible(!dense);
+        let (cpu, memory) = if compact {
+            if video_visible { (20, 12) } else { (44, 24) }
         } else {
             (CPU_GRAPH_HEIGHT, MEMORY_GRAPH_HEIGHT)
         };
