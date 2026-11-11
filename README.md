@@ -8,6 +8,8 @@ Tillwind is a lightweight, Safari-inspired browser for Linux. Its Rust and GTK 4
 
 - **Address and search in one field.** The field shows the site’s hostname while you browse and the full URL when you focus it. Enter a URL to navigate or type a search to send it to DuckDuckGo.
 - **Separate tab strip.** Tabs show page titles and site icons when available. Drag tabs to reorder them, close them from the left side of the tab, or use the keyboard to switch among the first nine.
+- **Tab groups.** Open the group menu or press Ctrl+Shift+G. Create a named group from the current tab, move tabs between groups, rename groups, and remove a group while keeping its tabs in Ungrouped. Tillwind remembers groups and their membership when you close the window.
+- **Appearance.** Choose System, Light, or Dark from the appearance menu. The choice is saved with your session and updates the color-scheme preference exposed to websites that support it.
 - **Navigation controls.** Go back or forward from the toolbar and reload from the address field.
 - **Lazy session restore.** Tillwind saves the tab URLs, their order, and the selected tab on normal window close. At startup it loads the selected tab first and opens each background page when you select its tab. Session restore saves URLs only. Page history and unsaved form entries are outside the saved session.
 - **Performance sidebar.** Open the monitor from the toolbar or press Ctrl+Shift+P. The translucent sidebar overlays the selected page without resizing it, shows CPU and resident memory history for its main WebKit renderer, and lists Tillwind and any shared WebKit network or GPU processes separately. The overlay lists the host CPU model and detected graphics adapters. The GPU panel reports the busiest measured engine for the tab renderer and shared browser processes when Linux DRM counters are available. Hover over the readings for engine details. Install the optional `pciutils` package for PCI GPU model names. The process table includes PID, CPU, resident memory, and thread count. When the main page exposes an HTML video, the sidebar also shows resolution, buffered time, and dropped frames. Sampling pauses when the sidebar is closed.
@@ -18,6 +20,12 @@ Tillwind is a lightweight, Safari-inspired browser for Linux. Its Rust and GTK 4
 | Google Search | AP News |
 | --- | --- |
 | ![Tillwind displaying Google Search results for Linux web browsers](docs/screenshots/google-search.png) | ![Tillwind displaying the AP News homepage](docs/screenshots/ap-news.png) |
+
+### Light and dark appearance
+
+| Light | Dark |
+| --- | --- |
+| ![Tillwind in light mode with the Everyday tab group and YouTube](docs/screenshots/appearance-light.png) | ![Tillwind in dark mode with the Everyday tab group and YouTube](docs/screenshots/appearance-dark.png) |
 
 ## Run on Linux
 
@@ -40,7 +48,8 @@ cargo run --release --locked
 | Ctrl+T | Open a new tab |
 | Ctrl+W | Close the current tab |
 | Ctrl+R | Reload the current page |
-| Ctrl+1–9 | Select a tab by position |
+| Ctrl+1–9 | Select a tab by position within the active group |
+| Ctrl+Shift+G | Open Tab Groups |
 | Ctrl+Shift+P | Show or hide the performance sidebar |
 
 ## Testing

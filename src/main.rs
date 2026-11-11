@@ -1,7 +1,13 @@
 mod gpu;
+mod groups;
 mod performance;
 
-use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    path::PathBuf,
+    rc::Rc,
+    time::Duration,
+};
 
 use gtk::{gio, glib, prelude::*};
 use serde::{Deserialize, Serialize};
@@ -11,10 +17,57 @@ use webkit6::{WebView, prelude::*};
 const APP_ID: &str = "io.github.cdomin1.Tillwind";
 const BLANK: &str = "about:blank";
 
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Appearance {
+    Light,
+    Dark,
+    #[default]
+    #[serde(other)]
+    System,
+}
+
+impl Appearance {
+    fn is_system(&self) -> bool {
+        matches!(self, Self::System)
+    }
+
+    fn value(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    fn apply(self, window: &gtk::ApplicationWindow) {
+        window.remove_css_class("appearance-light");
+        window.remove_css_class("appearance-dark");
+        if let Some(settings) = gtk::Settings::default() {
+            if self.is_system() {
+                settings.reset_property("gtk-application-prefer-dark-theme");
+            } else {
+                settings.set_gtk_application_prefer_dark_theme(matches!(self, Self::Dark));
+                window.add_css_class(if matches!(self, Self::Dark) {
+                    "appearance-dark"
+                } else {
+                    "appearance-light"
+                });
+            }
+        }
+    }
+}
+
 #[derive(Default, Deserialize, Serialize)]
 struct Session {
     urls: Vec<String>,
     selected: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    groups: Vec<groups::Group>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tab_groups: Vec<Option<u64>>,
+    #[serde(default, skip_serializing_if = "Appearance::is_system")]
+    appearance: Appearance,
 }
 
 impl Session {
@@ -50,6 +103,7 @@ struct Tab {
     favicon: gtk::Image,
     uri: RefCell<String>,
     view: RefCell<Option<WebView>>,
+    group: Cell<Option<u64>>,
 }
 
 struct Browser {
@@ -60,6 +114,9 @@ struct Browser {
     forward: gtk::Button,
     tabs: RefCell<Vec<Rc<Tab>>>,
     performance: Rc<performance::Performance>,
+    groups: groups::TabGroups,
+    group_label: gtk::Label,
+    appearance: Cell<Appearance>,
 }
 
 fn web_uri(input: &str) -> Option<Url> {
@@ -141,7 +198,7 @@ impl Browser {
             .set_sensitive(view.as_ref().is_some_and(|view| view.can_go_forward()));
     }
 
-    fn add_tab(self: &Rc<Self>, uri: String) -> u32 {
+    fn add_tab(self: &Rc<Self>, uri: String, group: Option<u64>) -> u32 {
         let title = web_uri(&uri)
             .and_then(|url| url.host_str().map(str::to_owned))
             .unwrap_or_else(|| "New Tab".into());
@@ -155,6 +212,7 @@ impl Browser {
             favicon: gtk::Image::from_icon_name("web-browser-symbolic"),
             uri: RefCell::new(uri),
             view: RefCell::new(None),
+            group: Cell::new(group),
         });
         tab.label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         tab.label.set_max_width_chars(24);
@@ -186,7 +244,7 @@ impl Browser {
     }
 
     fn close_tab(self: &Rc<Self>, tab: &Tab) {
-        if self.notebook.n_pages() == 1 {
+        if self.tabs_in_group(tab.group.get()).len() == 1 {
             self.new_tab();
         }
         if let Some(index) = self.notebook.page_num(&tab.page) {
@@ -198,7 +256,7 @@ impl Browser {
     }
 
     fn new_tab(self: &Rc<Self>) {
-        let index = self.add_tab(BLANK.into());
+        let index = self.add_tab(BLANK.into(), self.groups.active.get());
         self.notebook.set_current_page(Some(index));
         self.address.grab_focus();
     }
@@ -315,13 +373,20 @@ impl Browser {
     }
 
     fn save(&self) {
+        let ordered: Vec<_> = (0..self.notebook.n_pages())
+            .filter_map(|index| self.notebook.nth_page(Some(index)))
+            .filter_map(|page| self.tab_for(&page))
+            .collect();
+        let mut tab_groups: Vec<_> = ordered.iter().map(|tab| tab.group.get()).collect();
+        if tab_groups.iter().all(Option::is_none) {
+            tab_groups.clear();
+        }
         let session = Session {
-            urls: (0..self.notebook.n_pages())
-                .filter_map(|index| self.notebook.nth_page(Some(index)))
-                .filter_map(|page| self.tab_for(&page))
-                .map(|tab| tab.uri.borrow().clone())
-                .collect(),
+            urls: ordered.iter().map(|tab| tab.uri.borrow().clone()).collect(),
             selected: self.notebook.current_page().unwrap_or(0),
+            groups: self.groups.groups.borrow().clone(),
+            tab_groups,
+            appearance: self.appearance.get(),
         };
         if let Err(error) = session.save() {
             eprintln!("Could not save session: {error}");
@@ -358,16 +423,49 @@ fn build_window(app: &gtk::Application) {
     let back = icon("go-previous-symbolic", "Back");
     let forward = icon("go-next-symbolic", "Forward");
     let add = icon("list-add-symbolic", "New tab");
-    header.pack_start(&back);
-    header.pack_start(&forward);
-    header.pack_end(&add);
+    let groups_menu = gtk::MenuButton::new();
+    groups_menu.add_css_class("toolbar-pill");
+    groups_menu.set_always_show_arrow(true);
+    groups_menu.set_tooltip_text(Some("Tab Groups (Ctrl+Shift+G)"));
+    let group_label = gtk::Label::new(Some("Tabs"));
+    group_label.set_max_width_chars(12);
+    group_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let group_button = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+    group_button.append(&gtk::Image::from_icon_name("view-list-symbolic"));
+    group_button.append(&group_label);
+    groups_menu.set_child(Some(&group_button));
+    let groups_popover = gtk::Popover::new();
+    groups_menu.set_popover(Some(&groups_popover));
+    header.pack_start(&groups_menu);
+    let navigation = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    navigation.add_css_class("toolbar-pill");
+    navigation.append(&back);
+    navigation.append(&forward);
+    header.pack_start(&navigation);
+
     let monitor = gtk::ToggleButton::new();
     monitor.set_child(Some(&performance::gauge_icon()));
     monitor.add_css_class("flat");
     monitor.add_css_class("performance-toggle");
     monitor.set_tooltip_text(Some("Performance sidebar (Ctrl+Shift+P)"));
     monitor.update_property(&[gtk::accessible::Property::Label("Performance sidebar")]);
-    header.pack_end(&monitor);
+    let appearance_menu = gtk::MenuButton::new();
+    appearance_menu.set_icon_name("display-brightness-symbolic");
+    appearance_menu.set_tooltip_text(Some("Appearance"));
+    appearance_menu.add_css_class("flat");
+    let appearances = gio::Menu::new();
+    for (label, value) in [("System", "system"), ("Light", "light"), ("Dark", "dark")] {
+        let item = gio::MenuItem::new(Some(label), None);
+        item.set_action_and_target_value(Some("win.appearance"), Some(&value.to_variant()));
+        appearances.append_item(&item);
+    }
+    appearance_menu.set_menu_model(Some(&appearances));
+    let utilities = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    utilities.add_css_class("toolbar-pill");
+    utilities.append(&appearance_menu);
+    utilities.append(&monitor);
+    utilities.append(&add);
+    header.pack_end(&utilities);
     window.set_titlebar(Some(&header));
     let notebook = gtk::Notebook::builder()
         .scrollable(true)
@@ -386,6 +484,9 @@ fn build_window(app: &gtk::Application) {
         forward,
         tabs: RefCell::new(Vec::new()),
         performance,
+        groups: Default::default(),
+        group_label,
+        appearance: Cell::new(Appearance::System),
     });
 
     if let Some(data_manager) =
@@ -394,30 +495,85 @@ fn build_window(app: &gtk::Application) {
         data_manager.set_favicons_enabled(true);
     }
     let session = Session::read();
-    for uri in session.urls {
+    browser.groups.groups.replace(session.groups);
+    browser.appearance.set(session.appearance);
+    session.appearance.apply(&window);
+    let appearance_action = gio::SimpleAction::new_stateful(
+        "appearance",
+        Some(glib::VariantTy::STRING),
+        &session.appearance.value().to_variant(),
+    );
+    appearance_action.connect_activate(glib::clone!(
+        #[weak]
+        browser,
+        #[weak]
+        window,
+        move |action, value| {
+            let appearance = match value.and_then(glib::Variant::str) {
+                Some("system") => Appearance::System,
+                Some("light") => Appearance::Light,
+                Some("dark") => Appearance::Dark,
+                _ => return,
+            };
+            browser.appearance.set(appearance);
+            appearance.apply(&window);
+            action.set_state(&appearance.value().to_variant());
+        }
+    ));
+    window.add_action(&appearance_action);
+    let mut selected = None;
+    for (index, uri) in session.urls.into_iter().enumerate() {
         if uri == BLANK || web_uri(&uri).is_some() {
-            browser.add_tab(uri);
+            let group = session
+                .tab_groups
+                .get(index)
+                .copied()
+                .flatten()
+                .filter(|id| {
+                    browser
+                        .groups
+                        .groups
+                        .borrow()
+                        .iter()
+                        .any(|group| group.id == *id)
+                });
+            let page = browser.add_tab(uri, group);
+            if index == session.selected as usize {
+                selected = browser
+                    .notebook
+                    .nth_page(Some(page))
+                    .and_then(|page| browser.tab_for(&page));
+            }
         }
     }
-    if browser.notebook.n_pages() == 0 {
-        browser.add_tab(BLANK.into());
-    }
+    let selected = selected.or_else(|| browser.current());
+    let group = selected.as_ref().and_then(|tab| tab.group.get());
+    browser.show_group(group, selected);
     browser.notebook.connect_switch_page(glib::clone!(
         #[weak]
         browser,
         move |_, page, _| {
-            if let Some(tab) = browser.tab_for(page) {
+            if !browser.groups.changing.get()
+                && let Some(tab) = browser.tab_for(page)
+            {
                 browser.activate_tab(&tab);
                 browser.refresh_performance();
             }
         }
     ));
-    browser
-        .notebook
-        .set_current_page(Some(session.selected.min(browser.notebook.n_pages() - 1)));
-    if let Some(tab) = browser.current() {
-        browser.activate_tab(&tab);
-    }
+    groups_popover.connect_show(glib::clone!(
+        #[weak]
+        browser,
+        move |popover| groups::populate(&browser, popover)
+    ));
+    let open_groups = gio::SimpleAction::new("open-groups", None);
+    open_groups.connect_activate(glib::clone!(
+        #[weak]
+        groups_menu,
+        move |_, _| groups_menu.popup()
+    ));
+    window.add_action(&open_groups);
+    app.set_accels_for_action("win.open-groups", &["<Control><Shift>g"]);
 
     browser.address_focus.connect_enter(glib::clone!(
         #[weak]
@@ -553,9 +709,13 @@ fn build_window(app: &gtk::Application) {
         browser,
         move |_, parameter| {
             if let Some(index) = parameter.and_then(glib::Variant::get::<u32>)
-                && index < browser.notebook.n_pages()
+                && let Some(tab) = browser
+                    .tabs_in_group(browser.groups.active.get())
+                    .get(index as usize)
             {
-                browser.notebook.set_current_page(Some(index));
+                browser
+                    .notebook
+                    .set_current_page(browser.notebook.page_num(&tab.page));
             }
         }
     ));
@@ -603,4 +763,35 @@ fn main() -> glib::ExitCode {
     });
     app.connect_activate(build_window);
     app.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sessions_from_before_tab_groups_remain_compatible() {
+        let session: Session =
+            serde_json::from_str(r#"{"urls":["https://example.com/"],"selected":0}"#).unwrap();
+        assert!(session.groups.is_empty());
+        assert!(session.tab_groups.is_empty());
+        assert!(session.appearance.is_system());
+        assert_eq!(
+            serde_json::to_value(session).unwrap(),
+            serde_json::json!({"urls":["https://example.com/"],"selected":0})
+        );
+    }
+
+    #[test]
+    fn group_membership_and_appearance_survive_serialization() {
+        let value = serde_json::json!({
+            "urls": ["https://example.com/", "about:blank"],
+            "selected": 1,
+            "groups": [{"id": 7, "name": "Research"}],
+            "tab_groups": [null, 7],
+            "appearance": "dark"
+        });
+        let session: Session = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(session).unwrap(), value);
+    }
 }

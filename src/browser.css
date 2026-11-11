@@ -1,9 +1,9 @@
 headerbar.browser-toolbar {
-    background: @theme_bg_color;
+    background: linear-gradient(to bottom, shade(@theme_bg_color, 1.04), @theme_bg_color);
     border: 0;
     border-bottom: 1px solid alpha(@theme_fg_color, 0.14);
     box-shadow: none;
-    padding: 4px 7px;
+    padding: 4px 8px;
 }
 
 headerbar.browser-toolbar button {
@@ -11,9 +11,9 @@ headerbar.browser-toolbar button {
 }
 
 entry.browser-address {
-    background: alpha(@theme_fg_color, 0.075);
+    background: alpha(@theme_base_color, 0.74);
     border: 1px solid alpha(@theme_fg_color, 0.09);
-    border-radius: 8px;
+    border-radius: 999px;
     box-shadow: none;
     min-height: 28px;
     padding: 0 8px;
@@ -32,18 +32,18 @@ notebook.browser-tabs > header.top {
     background: @theme_bg_color;
     border: 0;
     border-bottom: 1px solid alpha(@theme_fg_color, 0.14);
-    padding: 3px 5px;
+    padding: 3px 7px;
 }
 
 notebook.browser-tabs > header > tabs > tab {
     background: transparent;
     border: 0;
-    border-radius: 6px;
+    border-radius: 999px;
     box-shadow: none;
     color: @theme_fg_color;
     font-size: 0.9em;
     margin: 0 2px;
-    min-height: 25px;
+    min-height: 24px;
     padding: 0 8px 0 4px;
 }
 
@@ -52,7 +52,8 @@ notebook.browser-tabs > header > tabs > tab:hover {
 }
 
 notebook.browser-tabs > header > tabs > tab:checked {
-    background: alpha(@theme_fg_color, 0.12);
+    background: @theme_base_color;
+    box-shadow: inset 0 0 0 1px alpha(@theme_fg_color, 0.13);
 }
 
 notebook.browser-tabs button.tab-close {
@@ -154,4 +155,63 @@ headerbar.browser-toolbar button.performance-toggle:checked {
 
 .performance-panel .performance-gpu .performance-value {
     color: #b0d8de;
+}
+
+headerbar.browser-toolbar .toolbar-pill {
+    border: 1px solid alpha(@theme_fg_color, 0.11);
+    border-radius: 999px;
+    background: alpha(@theme_base_color, 0.55);
+}
+
+headerbar.browser-toolbar .toolbar-pill button {
+    border-radius: 999px;
+    min-height: 27px;
+    min-width: 27px;
+    margin: 0;
+    padding: 0 5px;
+}
+
+notebook.browser-tabs > header > tabs {
+    border-radius: 999px;
+    background: alpha(@theme_fg_color, 0.05);
+}
+
+.appearance-light headerbar.browser-toolbar,
+.appearance-light notebook.browser-tabs > header.top {
+    background: #efedf3;
+    color: #25232b;
+}
+
+.appearance-dark headerbar.browser-toolbar,
+.appearance-dark notebook.browser-tabs > header.top {
+    background: #1b1d23;
+    color: #ececf1;
+}
+
+.appearance-dark headerbar.browser-toolbar .toolbar-pill,
+.appearance-dark entry.browser-address,
+.appearance-dark notebook.browser-tabs > header > tabs > tab:checked {
+    background: #292c35;
+    color: #ececf1;
+}
+
+.appearance-light headerbar.browser-toolbar .toolbar-pill,
+.appearance-light entry.browser-address {
+    background: #faf9fc;
+    color: #25232b;
+}
+
+.tab-groups-menu {
+    padding: 8px;
+    min-width: 220px;
+}
+
+.tab-groups-menu .current-group {
+    background: alpha(@theme_selected_bg_color, 0.14);
+}
+
+headerbar.browser-toolbar .toolbar-pill button:not(:hover):not(:checked) {
+    background: transparent;
+    border-color: transparent;
+    box-shadow: none;
 }
