@@ -1,4 +1,6 @@
-use std::{cell::RefCell, path::PathBuf, rc::Rc};
+mod performance;
+
+use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
 
 use gtk::{gio, glib, prelude::*};
 use serde::{Deserialize, Serialize};
@@ -55,6 +57,7 @@ struct Browser {
     back: gtk::Button,
     forward: gtk::Button,
     tabs: RefCell<Vec<Rc<Tab>>>,
+    performance: Rc<performance::Performance>,
 }
 
 fn web_uri(input: &str) -> Option<Url> {
@@ -292,6 +295,18 @@ impl Browser {
         self.sync_navigation(tab);
     }
 
+    fn refresh_performance(&self) {
+        if self.performance.widget.is_visible()
+            && let Some(tab) = self.current()
+            && let Some(view) = tab.view.borrow().as_ref()
+        {
+            let uri = tab.uri.borrow();
+            let site = web_uri(&uri);
+            let host = site.as_ref().and_then(Url::host_str).unwrap_or("New Tab");
+            self.performance.refresh(view, host);
+        }
+    }
+
     fn save(&self) {
         let session = Session {
             urls: (0..self.notebook.n_pages())
@@ -339,13 +354,24 @@ fn build_window(app: &gtk::Application) {
     header.pack_start(&back);
     header.pack_start(&forward);
     header.pack_end(&add);
+    let monitor = gtk::ToggleButton::new();
+    monitor.set_icon_name("utilities-system-monitor-symbolic");
+    monitor.add_css_class("flat");
+    monitor.set_tooltip_text(Some("Performance sidebar (Ctrl+Shift+P)"));
+    monitor.update_property(&[gtk::accessible::Property::Label("Performance sidebar")]);
+    header.pack_end(&monitor);
     window.set_titlebar(Some(&header));
     let notebook = gtk::Notebook::builder()
         .scrollable(true)
         .show_border(false)
         .build();
     notebook.add_css_class("browser-tabs");
-    window.set_child(Some(&notebook));
+    let performance = performance::Performance::new();
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    notebook.set_hexpand(true);
+    content.append(&notebook);
+    content.append(&performance.widget);
+    window.set_child(Some(&content));
     let address_focus = gtk::EventControllerFocus::new();
     address.add_controller(address_focus.clone());
     let browser = Rc::new(Browser {
@@ -355,6 +381,7 @@ fn build_window(app: &gtk::Application) {
         back,
         forward,
         tabs: RefCell::new(Vec::new()),
+        performance,
     });
 
     if let Some(data_manager) =
@@ -377,6 +404,7 @@ fn build_window(app: &gtk::Application) {
         move |_, page, _| {
             if let Some(tab) = browser.tab_for(page) {
                 browser.activate_tab(&tab);
+                browser.refresh_performance();
             }
         }
     ));
@@ -436,6 +464,35 @@ fn build_window(app: &gtk::Application) {
         browser,
         move |_| browser.new_tab()
     ));
+
+    monitor.connect_toggled(glib::clone!(
+        #[weak]
+        browser,
+        move |button| {
+            browser.performance.widget.set_visible(button.is_active());
+            if button.is_active() {
+                browser.refresh_performance();
+            } else {
+                browser.performance.reset();
+            }
+        }
+    ));
+    let toggle_performance = gio::SimpleAction::new("toggle-performance", None);
+    toggle_performance.connect_activate(glib::clone!(
+        #[weak]
+        monitor,
+        move |_, _| monitor.set_active(!monitor.is_active())
+    ));
+    window.add_action(&toggle_performance);
+    app.set_accels_for_action("win.toggle-performance", &["<Control><Shift>p"]);
+    let browser_ref = Rc::downgrade(&browser);
+    glib::timeout_add_local(Duration::from_secs(1), move || {
+        let Some(browser) = browser_ref.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        browser.refresh_performance();
+        glib::ControlFlow::Continue
+    });
 
     let reload = gio::SimpleAction::new("reload", None);
     reload.connect_activate(glib::clone!(
@@ -508,6 +565,7 @@ fn build_window(app: &gtk::Application) {
     app.set_accels_for_action("win.close-tab", &["<Control>w"]);
     app.set_accels_for_action("win.focus-address", &["<Control>l"]);
     window.connect_close_request(move |_| {
+        browser.performance.reset();
         browser.save();
         glib::Propagation::Proceed
     });
@@ -516,7 +574,19 @@ fn build_window(app: &gtk::Application) {
 
 fn main() -> glib::ExitCode {
     let app = gtk::Application::builder().application_id(APP_ID).build();
-    app.connect_startup(|_| {
+    let extension = match performance::WebExtension::install() {
+        Ok(extension) => Some(Rc::new(extension)),
+        Err(error) => {
+            eprintln!("Tab performance extension unavailable: {error}");
+            None
+        }
+    };
+    app.connect_startup(move |_| {
+        if let Some(extension) = &extension
+            && let Some(context) = webkit6::WebContext::default()
+        {
+            extension.configure(&context);
+        }
         let provider = gtk::CssProvider::new();
         provider.load_from_data(include_str!("browser.css"));
         if let Some(display) = gtk::gdk::Display::default() {

@@ -68,3 +68,44 @@ notebook.browser-tabs tab:checked button.tab-close,
 notebook.browser-tabs button.tab-close:focus-visible {
     opacity: 1;
 }
+
+.performance-panel {
+    background: #151921;
+    color: #d6deeb;
+    border-left: 1px solid #384255;
+    padding: 15px;
+}
+
+.performance-panel label {
+    font-family: monospace;
+    font-size: 12px;
+}
+
+.performance-panel .performance-heading {
+    font-size: 16px;
+    font-weight: bold;
+}
+
+.performance-panel .performance-site {
+    color: #aab8cc;
+    border-bottom: 1px solid #384255;
+    padding-bottom: 8px;
+}
+
+.performance-panel .performance-cpu {
+    color: #79e4c3;
+}
+
+.performance-panel .performance-memory {
+    color: #e3a5ff;
+}
+
+.performance-panel .performance-table {
+    border-top: 1px solid #384255;
+    padding-top: 9px;
+}
+
+.performance-panel .performance-note {
+    color: #aab8cc;
+    font-size: 11px;
+}
