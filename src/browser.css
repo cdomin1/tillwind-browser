@@ -142,3 +142,8 @@ headerbar.browser-toolbar button.performance-toggle:checked {
     background: alpha(@theme_fg_color, 0.10);
     box-shadow: none;
 }
+
+.performance-panel .performance-hardware {
+    color: #c6bda5;
+    font-size: 11px;
+}

@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fs, io,
     path::PathBuf,
+    process::Command,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -331,9 +332,96 @@ struct VideoStats {
     buffer: f64,
 }
 
+fn hardware_names() -> (String, String) {
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let cpu = ["model name", "cpu model", "Processor", "uarch"]
+        .into_iter()
+        .find_map(|field| {
+            cpuinfo.lines().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                let value = value.trim();
+                (key.trim() == field && !value.is_empty()).then_some(value)
+            })
+        })
+        .unwrap_or("Model unavailable");
+    let cpu = cpu
+        .split(" @ ")
+        .next()
+        .unwrap_or(cpu)
+        .replace("(R)", "")
+        .replace("(TM)", "");
+
+    let mut gpus = Vec::new();
+    if let Ok(output) = Command::new("lspci")
+        .arg("-vmm")
+        .env("LC_ALL", "C")
+        .output()
+        && output.status.success()
+    {
+        let listing = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+        for record in listing.split("\n\n") {
+            let value = |name: &str| {
+                record.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    (key == name).then_some(value.trim())
+                })
+            };
+            if matches!(
+                value("Class"),
+                Some("VGA compatible controller" | "3D controller" | "Display controller")
+            ) && let Some(device) = value("Device")
+            {
+                let model = device
+                    .strip_suffix(']')
+                    .and_then(|name| name.rsplit_once(" ["))
+                    .map_or(device, |(_, model)| model);
+                gpus.push(model.to_owned());
+            }
+        }
+    }
+    if gpus.is_empty() {
+        // PCI IDs and the driver remain available when pciutils is missing.
+        for card in fs::read_dir("/sys/class/drm")
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = card.file_name();
+            let Some(index) = name.to_str().and_then(|name| name.strip_prefix("card")) else {
+                continue;
+            };
+            if index.parse::<u32>().is_err() {
+                continue;
+            }
+            let Ok(uevent) = fs::read_to_string(card.path().join("device/uevent")) else {
+                continue;
+            };
+            let driver = uevent.lines().find_map(|line| line.strip_prefix("DRIVER="));
+            let pci = uevent.lines().find_map(|line| line.strip_prefix("PCI_ID="));
+            match (driver, pci) {
+                (Some(driver), Some(pci)) => gpus.push(format!("{driver} · {pci}")),
+                (Some(driver), None) => gpus.push(driver.to_owned()),
+                (None, Some(pci)) => gpus.push(pci.to_owned()),
+                (None, None) => {}
+            }
+        }
+    }
+    gpus.sort_unstable();
+    gpus.dedup();
+    let gpu = if gpus.is_empty() {
+        "Model unavailable".into()
+    } else {
+        gpus.join(", ")
+    };
+    (cpu, gpu)
+}
+
 pub struct Performance {
     pub widget: gtk::ScrolledWindow,
     site: gtk::Label,
+    cpu_model: gtk::Label,
+    gpu_model: gtk::Label,
+    hardware_loaded: Cell<bool>,
     cpu: gtk::Label,
     memory: gtk::Label,
     cpu_graph: gtk::DrawingArea,
@@ -356,6 +444,11 @@ impl Performance {
         let heading = label("Performance", "performance-heading");
         let site = label("New Tab", "performance-site");
         site.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        let cpu_model = label("", "performance-hardware");
+        let gpu_model = label("", "performance-hardware");
+        for model in [&cpu_model, &gpu_model] {
+            model.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        }
         let cpu = label("—", "performance-value");
         let memory = label("—", "performance-value");
         let history = Rc::new(RefCell::new(History::default()));
@@ -374,20 +467,22 @@ impl Performance {
             MEMORY_GRAPH_HEIGHT,
         );
         let cpu_contents = gtk::Box::new(gtk::Orientation::Vertical, 5);
+        cpu_contents.append(&cpu_model);
         cpu_contents.append(&cpu);
         cpu_contents.append(&cpu_graph);
         let memory_contents = gtk::Box::new(gtk::Orientation::Vertical, 5);
         memory_contents.append(&memory);
         memory_contents.append(&memory_graph);
         let processes = label("", "performance-table");
-        let note = label(
-            "CPU · 100% = one core. RSS includes shared memory. WebKit can share a renderer between pages.",
-            "performance-note",
-        );
+        let note = label("100% CPU = one core · memory = RSS", "performance-note");
+        note.set_tooltip_text(Some(
+            "RSS includes shared memory. WebKit can share a renderer between pages.",
+        ));
         note.set_wrap(true);
         note.set_max_width_chars(35);
         panel.append(&heading);
         panel.append(&site);
+        panel.append(&gpu_model);
         panel.append(&panel_frame("cpu", "performance-cpu", &[&cpu_contents]));
         panel.append(&panel_frame(
             "mem",
@@ -415,6 +510,9 @@ impl Performance {
         Rc::new(Self {
             widget,
             site,
+            cpu_model,
+            gpu_model,
+            hardware_loaded: Cell::new(false),
             cpu,
             memory,
             cpu_graph,
@@ -457,6 +555,14 @@ impl Performance {
     }
 
     pub fn refresh(self: &Rc<Self>, view: &WebView, site: &str) {
+        if !self.hardware_loaded.replace(true) {
+            let (cpu, gpu) = hardware_names();
+            self.cpu_model.set_text(&cpu);
+            self.cpu_model.set_tooltip_text(Some(&cpu));
+            self.gpu_model.set_text(&format!("GPU · {gpu}"));
+            self.gpu_model
+                .set_tooltip_text(Some(&format!("Detected graphics adapters: {gpu}")));
+        }
         let page = view.page_id();
         if self.page.get() != page || self.site.text() != site {
             self.reset();
@@ -535,7 +641,7 @@ impl Performance {
 
     fn resize_graphs(&self, video_visible: bool) {
         let (cpu, memory) = if video_visible && self.widget.height() < 490 {
-            (46, 24)
+            (32, 18)
         } else {
             (CPU_GRAPH_HEIGHT, MEMORY_GRAPH_HEIGHT)
         };
