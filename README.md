@@ -27,7 +27,34 @@ Tillwind is a lightweight, Safari-inspired browser for Linux. Its Rust and GTK 4
 | --- | --- |
 | ![Tillwind in light mode with the Everyday tab group and YouTube](docs/screenshots/appearance-light.png) | ![Tillwind in dark mode with the Everyday tab group and YouTube](docs/screenshots/appearance-dark.png) |
 
-## Run on Linux
+## Install the Linux alpha
+
+Download an x86-64 package from [GitHub Releases](https://github.com/cdomin1/tillwind-browser/releases). You can verify both downloads with `sha256sum -c SHA256SUMS` from the same directory as the installers.
+
+### AppImage
+
+The AppImage uses your distribution’s GTK 4.10+ and WebKitGTK 6.0 runtime libraries. On Arch, install `gtk4` and `webkitgtk-6.0`. On Ubuntu 24.04, install `libgtk-4-1` and `libwebkitgtk-6.0-4`.
+
+```sh
+chmod +x Tillwind-x86_64.AppImage
+./Tillwind-x86_64.AppImage
+```
+
+If FUSE is unavailable, launch with `APPIMAGE_EXTRACT_AND_RUN=1 ./Tillwind-x86_64.AppImage`.
+
+### Flatpak
+
+With Flatpak installed, add Flathub for the GNOME runtime, then install the downloaded bundle.
+
+```sh
+flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+flatpak install --user ./Tillwind-x86_64.flatpak
+flatpak run io.github.cdomin1.Tillwind//alpha
+```
+
+GPU and process readings depend on what the drivers and the Flatpak sandbox expose.
+
+## Build from source
 
 Install a current stable Rust toolchain, a C toolchain, `pkg-config`, GTK 4.10 or later, and the WebKitGTK 6.0 development libraries.
 
@@ -56,7 +83,7 @@ cargo run --release --locked
 
 See the [performance notes](docs/performance.md) for the JavaScript baseline, hardware-decoding results, and GPU vendor support.
 
-The GitHub Actions Linux build checks Rust formatting and builds against GTK and WebKitGTK. Desktop UI and media playback need a separate smoke test.
+The GitHub Actions Linux build checks Rust formatting and builds against GTK and WebKitGTK. The packaging workflow installs or extracts each alpha package, launches it on an isolated X11 display, and verifies that a test page executes JavaScript. Media playback and native Wayland still need separate testing.
 
 1. Start `python3 -m http.server 8000 --bind 127.0.0.1` in a scratch directory. Open three tabs at `http://127.0.0.1:8000/?tab=1`, `http://127.0.0.1:8000/?tab=2`, and `http://127.0.0.1:8000/?tab=3`. Select tab 2, close the window, and relaunch. The server should receive the request for tab 2 first. Requests for tabs 1 and 3 should arrive when you select them.
 2. For a playback comparison, use the same clip, codec, resolution, and frame rate in both browsers. Record the decoder, total browser CPU use, and dropped frames. Playback formats and hardware decoding depend on the installed WebKitGTK and GStreamer stack.

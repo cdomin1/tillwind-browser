@@ -21,13 +21,13 @@ jobs:
           rustup toolchain install stable --profile minimal
       - name: Build AppImage
         run: |
-          cargo +stable test --locked
+          cargo +stable test --release --locked
           cargo +stable build --release --locked
           app_id=io.github.cdomin1.Tillwind
           sh packaging/install.sh AppDir/usr
           install -m755 packaging/AppRun AppDir/AppRun
           ln -s "usr/share/applications/$app_id.desktop" "AppDir/$app_id.desktop"
-          ln -s "usr/share/icons/hicolor/1024x1024/apps/$app_id.png" "AppDir/$app_id.png"
+          ln -s "usr/share/icons/hicolor/512x512/apps/$app_id.png" "AppDir/$app_id.png"
           curl --fail --silent --show-error --location --retry 3 \
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
             -o appimagetool

@@ -24,7 +24,7 @@
       "name": "tillwind",
       "buildsystem": "simple",
       "build-commands": [
-        "cargo test --locked --offline",
+        "cargo test --release --locked --offline",
         "cargo build --release --locked --offline",
         "sh packaging/install.sh /app"
       ],
