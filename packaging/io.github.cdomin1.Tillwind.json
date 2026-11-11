@@ -1,0 +1,36 @@
+{
+  "app-id": "io.github.cdomin1.Tillwind",
+  "runtime": "org.gnome.Platform",
+  "runtime-version": "50",
+  "sdk": "org.gnome.Sdk",
+  "sdk-extensions": ["org.freedesktop.Sdk.Extension.rust-stable"],
+  "command": "tillwind",
+  "finish-args": [
+    "--share=network",
+    "--share=ipc",
+    "--socket=wayland",
+    "--socket=fallback-x11",
+    "--socket=pulseaudio",
+    "--device=dri"
+  ],
+  "build-options": {
+    "append-path": "/usr/lib/sdk/rust-stable/bin",
+    "env": {
+      "CARGO_HOME": "/run/build/tillwind/.cargo"
+    }
+  },
+  "modules": [
+    {
+      "name": "tillwind",
+      "buildsystem": "simple",
+      "build-commands": [
+        "cargo test --locked --offline",
+        "cargo build --release --locked --offline",
+        "sh packaging/install.sh /app"
+      ],
+      "sources": [
+        { "type": "dir", "path": "../flatpak-source" }
+      ]
+    }
+  ]
+}

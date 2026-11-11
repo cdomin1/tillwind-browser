@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Tillwind
+Comment=Browse the web
+Exec=tillwind
+Icon=io.github.cdomin1.Tillwind
+Terminal=false
+Categories=Network;WebBrowser;
+StartupNotify=true

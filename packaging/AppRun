@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+appdir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+export XDG_DATA_DIRS="$appdir/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+exec "$appdir/usr/bin/tillwind" "$@"

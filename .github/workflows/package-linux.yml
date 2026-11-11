@@ -1,0 +1,83 @@
+name: Package Linux alpha
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  appimage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev libfuse2t64 xvfb xauth xdotool squashfs-tools
+          rustup toolchain install stable --profile minimal
+      - name: Build AppImage
+        run: |
+          cargo +stable test --locked
+          cargo +stable build --release --locked
+          app_id=io.github.cdomin1.Tillwind
+          sh packaging/install.sh AppDir/usr
+          install -m755 packaging/AppRun AppDir/AppRun
+          ln -s "usr/share/applications/$app_id.desktop" "AppDir/$app_id.desktop"
+          ln -s "usr/share/icons/hicolor/1024x1024/apps/$app_id.png" "AppDir/$app_id.png"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+            -o appimagetool
+          chmod +x appimagetool
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool AppDir Tillwind-x86_64.AppImage
+      - name: Smoke-test AppImage
+        run: |
+          # Permit WebKit's user namespace sandbox on the disposable CI runner.
+          if test -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          APPIMAGE_EXTRACT_AND_RUN=1 xvfb-run -a dbus-run-session -- python3 packaging/smoke.py ./Tillwind-x86_64.AppImage
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tillwind-appimage
+          path: Tillwind-x86_64.AppImage
+          if-no-files-found: error
+
+  flatpak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder xvfb xauth xdotool
+          if test -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          rustup toolchain install stable --profile minimal
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+      - name: Build Flatpak bundle
+        run: |
+          mkdir flatpak-source
+          git archive HEAD | tar -x -C flatpak-source
+          mkdir flatpak-source/.cargo
+          (cd flatpak-source && cargo +stable vendor --locked vendor > .cargo/config.toml)
+          flatpak-builder --user --arch=x86_64 --default-branch=alpha --repo=flatpak-repo \
+            --install-deps-from=flathub flatpak-build packaging/io.github.cdomin1.Tillwind.json
+          flatpak build-bundle --arch=x86_64 --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
+            flatpak-repo Tillwind-x86_64.flatpak io.github.cdomin1.Tillwind alpha
+      - name: Smoke-test Flatpak bundle
+        run: |
+          flatpak install --user --noninteractive ./Tillwind-x86_64.flatpak
+          xvfb-run -a dbus-run-session -- python3 packaging/smoke.py flatpak run io.github.cdomin1.Tillwind//alpha
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tillwind-flatpak
+          path: Tillwind-x86_64.flatpak
+          if-no-files-found: error
