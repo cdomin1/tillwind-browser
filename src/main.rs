@@ -43,6 +43,7 @@ impl Session {
 struct Tab {
     page: gtk::Box,
     label: gtk::Label,
+    favicon: gtk::Image,
     uri: RefCell<String>,
     view: RefCell<Option<WebView>>,
 }
@@ -50,6 +51,7 @@ struct Tab {
 struct Browser {
     notebook: gtk::Notebook,
     address: gtk::Entry,
+    address_focus: gtk::EventControllerFocus,
     back: gtk::Button,
     forward: gtk::Button,
     tabs: RefCell<Vec<Rc<Tab>>>,
@@ -112,10 +114,21 @@ impl Browser {
             .and_then(|page| self.tab_for(&page))
     }
 
-    fn sync_navigation(&self, tab: &Tab) {
+    fn sync_address(&self, tab: &Tab, editing: bool) {
         let uri = tab.uri.borrow();
+        gtk::prelude::EntryExt::set_alignment(&self.address, if editing { 0.0 } else { 0.5 });
+        if uri.as_str() == BLANK {
+            self.address.set_text("");
+        } else if !editing && let Some(url) = web_uri(&uri) {
+            self.address.set_text(url.host_str().unwrap_or(&uri));
+        } else {
+            self.address.set_text(&uri);
+        }
         self.address
-            .set_text(if uri.as_str() == BLANK { "" } else { &uri });
+            .set_tooltip_text((uri.as_str() != BLANK).then_some(uri.as_str()));
+    }
+
+    fn sync_navigation(&self, tab: &Tab) {
         let view = tab.view.borrow();
         self.back
             .set_sensitive(view.as_ref().is_some_and(|view| view.can_go_back()));
@@ -130,15 +143,25 @@ impl Browser {
         let tab = Rc::new(Tab {
             page: gtk::Box::new(gtk::Orientation::Vertical, 0),
             label: gtk::Label::new(Some(&title)),
+            favicon: gtk::Image::from_icon_name("web-browser-symbolic"),
             uri: RefCell::new(uri),
             view: RefCell::new(None),
         });
         tab.label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        tab.label.set_max_width_chars(22);
+        tab.label.set_max_width_chars(24);
+        tab.label.set_hexpand(true);
+        tab.label.set_tooltip_text(Some(&title));
+        tab.favicon.set_pixel_size(14);
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let close = icon("window-close-symbolic", "Close tab");
-        header.append(&tab.label);
+        close.add_css_class("tab-close");
+        let title_group = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        title_group.set_halign(gtk::Align::Center);
+        title_group.set_hexpand(true);
+        title_group.append(&tab.favicon);
+        title_group.append(&tab.label);
         header.append(&close);
+        header.append(&title_group);
         close.connect_clicked(glib::clone!(
             #[weak(rename_to = browser)]
             self,
@@ -147,7 +170,10 @@ impl Browser {
             move |_| browser.close_tab(&tab)
         ));
         self.tabs.borrow_mut().push(tab.clone());
-        self.notebook.append_page(&tab.page, Some(&header))
+        let index = self.notebook.append_page(&tab.page, Some(&header));
+        self.notebook.page(&tab.page).set_tab_expand(true);
+        self.notebook.set_tab_reorderable(&tab.page, true);
+        index
     }
 
     fn close_tab(self: &Rc<Self>, tab: &Tab) {
@@ -230,6 +256,9 @@ impl Browser {
                         .current()
                         .is_some_and(|current| Rc::ptr_eq(&current, &tab))
                     {
+                        if !browser.address_focus.contains_focus() {
+                            browser.sync_address(&tab, false);
+                        }
                         browser.sync_navigation(&tab);
                     }
                 }
@@ -244,10 +273,22 @@ impl Browser {
                     }
                 }
             ));
+            view.connect_favicon_notify(glib::clone!(
+                #[weak]
+                tab,
+                move |view| {
+                    if let Some(favicon) = view.favicon() {
+                        tab.favicon.set_paintable(Some(&favicon));
+                    } else {
+                        tab.favicon.set_icon_name(Some("web-browser-symbolic"));
+                    }
+                }
+            ));
             *tab.view.borrow_mut() = Some(view.clone());
             let uri = tab.uri.borrow().clone();
             view.load_uri(&uri);
         }
+        self.sync_address(tab, self.address_focus.contains_focus());
         self.sync_navigation(tab);
     }
 
@@ -278,31 +319,49 @@ fn build_window(app: &gtk::Application) {
         .default_height(720)
         .build();
     let header = gtk::HeaderBar::new();
+    header.add_css_class("browser-toolbar");
     let address = gtk::Entry::builder()
-        .placeholder_text("Search or enter a URL")
-        .width_chars(42)
+        .placeholder_text("Search or enter website name")
+        .width_chars(36)
+        .max_width_chars(42)
+        .halign(gtk::Align::Center)
         .build();
     address.update_property(&[gtk::accessible::Property::Label("Address and search")]);
+    address.add_css_class("browser-address");
+    address.set_primary_icon_name(Some("edit-find-symbolic"));
+    address.set_primary_icon_activatable(false);
+    address.set_secondary_icon_name(Some("view-refresh-symbolic"));
+    address.set_secondary_icon_tooltip_text(Some("Reload page"));
     header.set_title_widget(Some(&address));
     let back = icon("go-previous-symbolic", "Back");
     let forward = icon("go-next-symbolic", "Forward");
-    let reload = icon("view-refresh-symbolic", "Reload");
     let add = icon("list-add-symbolic", "New tab");
     header.pack_start(&back);
     header.pack_start(&forward);
-    header.pack_start(&reload);
     header.pack_end(&add);
     window.set_titlebar(Some(&header));
-    let notebook = gtk::Notebook::builder().scrollable(true).build();
+    let notebook = gtk::Notebook::builder()
+        .scrollable(true)
+        .show_border(false)
+        .build();
+    notebook.add_css_class("browser-tabs");
     window.set_child(Some(&notebook));
+    let address_focus = gtk::EventControllerFocus::new();
+    address.add_controller(address_focus.clone());
     let browser = Rc::new(Browser {
         notebook,
         address,
+        address_focus,
         back,
         forward,
         tabs: RefCell::new(Vec::new()),
     });
 
+    if let Some(data_manager) =
+        webkit6::NetworkSession::default().and_then(|session| session.website_data_manager())
+    {
+        data_manager.set_favicons_enabled(true);
+    }
     let session = Session::read();
     for uri in session.urls {
         if uri == BLANK || web_uri(&uri).is_some() {
@@ -328,6 +387,24 @@ fn build_window(app: &gtk::Application) {
         browser.activate_tab(&tab);
     }
 
+    browser.address_focus.connect_enter(glib::clone!(
+        #[weak]
+        browser,
+        move |_| {
+            if let Some(tab) = browser.current() {
+                browser.sync_address(&tab, true);
+            }
+        }
+    ));
+    browser.address_focus.connect_leave(glib::clone!(
+        #[weak]
+        browser,
+        move |_| {
+            if let Some(tab) = browser.current() {
+                browser.sync_address(&tab, false);
+            }
+        }
+    ));
     browser.address.connect_activate(glib::clone!(
         #[weak]
         browser,
@@ -343,7 +420,6 @@ fn build_window(app: &gtk::Application) {
     for (button, navigate) in [
         (&browser.back, WebView::go_back as fn(&WebView)),
         (&browser.forward, WebView::go_forward as fn(&WebView)),
-        (&reload, WebView::reload as fn(&WebView)),
     ] {
         button.connect_clicked(glib::clone!(
             #[weak]
@@ -359,6 +435,27 @@ fn build_window(app: &gtk::Application) {
         #[weak]
         browser,
         move |_| browser.new_tab()
+    ));
+
+    let reload = gio::SimpleAction::new("reload", None);
+    reload.connect_activate(glib::clone!(
+        #[weak]
+        browser,
+        move |_, _| {
+            if let Some(view) = browser.current().and_then(|tab| tab.view.borrow().clone()) {
+                view.reload();
+            }
+        }
+    ));
+    window.add_action(&reload);
+    browser.address.connect_icon_release(glib::clone!(
+        #[weak]
+        reload,
+        move |_, position| {
+            if position == gtk::EntryIconPosition::Secondary {
+                reload.activate(None);
+            }
+        }
     ));
 
     let new_tab = gio::SimpleAction::new("new-tab", None);
@@ -389,6 +486,24 @@ fn build_window(app: &gtk::Application) {
         }
     ));
     window.add_action(&focus_address);
+    let select_tab = gio::SimpleAction::new("select-tab", Some(glib::VariantTy::UINT32));
+    select_tab.connect_activate(glib::clone!(
+        #[weak]
+        browser,
+        move |_, parameter| {
+            if let Some(index) = parameter.and_then(glib::Variant::get::<u32>)
+                && index < browser.notebook.n_pages()
+            {
+                browser.notebook.set_current_page(Some(index));
+            }
+        }
+    ));
+    window.add_action(&select_tab);
+    for index in 0..9u32 {
+        let action = gio::Action::print_detailed_name("win.select-tab", Some(&index.to_variant()));
+        app.set_accels_for_action(&action, &[&format!("<Control>{}", index + 1)]);
+    }
+    app.set_accels_for_action("win.reload", &["<Control>r"]);
     app.set_accels_for_action("win.new-tab", &["<Control>t"]);
     app.set_accels_for_action("win.close-tab", &["<Control>w"]);
     app.set_accels_for_action("win.focus-address", &["<Control>l"]);
@@ -401,6 +516,17 @@ fn build_window(app: &gtk::Application) {
 
 fn main() -> glib::ExitCode {
     let app = gtk::Application::builder().application_id(APP_ID).build();
+    app.connect_startup(|_| {
+        let provider = gtk::CssProvider::new();
+        provider.load_from_data(include_str!("browser.css"));
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+    });
     app.connect_activate(build_window);
     app.run()
 }
